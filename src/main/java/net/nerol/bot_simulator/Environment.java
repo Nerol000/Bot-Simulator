@@ -25,9 +25,10 @@ public class Environment {
         bot2.wasHit = false;
         stopMovement();
 
-        // Sticky sprint: cancel on conflicting movement or after taking a hit
-        if (action == Action.MOVE_BACK || action == Action.STRAFE_LEFT
-                || action == Action.STRAFE_RIGHT || bot1.wasHit) {
+        // Sticky sprint: cancel only on physically incompatible motion (backing up
+        // while running forward). Strafing, attacking, jumping, turning all keep sprint
+        // — the agent should be free to compose those with sustained forward motion.
+        if (action == Action.MOVE_BACK) {
             bot1.sprinting = false;
         }
 

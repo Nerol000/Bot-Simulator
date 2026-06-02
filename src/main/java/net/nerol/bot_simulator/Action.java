@@ -1,7 +1,7 @@
 package net.nerol.bot_simulator;
 
 public enum Action {
-    START_SPRINT,
+    SPRINT,
     MOVE_FORWARD,
     MOVE_BACK,
     STRAFE_LEFT,
