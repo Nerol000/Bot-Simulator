@@ -1,0 +1,39 @@
+package net.nerol.bot_simulator.minecraft.world.phys;
+
+import net.nerol.bot_simulator.minecraft.world.entity.PvPBot;
+
+public class Gravity {
+    // tuned similar to Minecraft (but simplified)
+    private static final double GRAVITY = -0.08;
+    private static final double TERMINAL_VELOCITY = -3.92;
+
+    public void apply(PvPBot e) {
+        // Update position
+        e.Pos.x += e.Motion.x;
+        e.Pos.y += e.Motion.y;
+        e.Pos.z += e.Motion.z;
+
+        // Gravity
+        if (!e.OnGround) {
+            e.Motion.y -= 0.08D;
+        }
+
+        // Drag
+        e.Motion.x *= 0.91F;
+        e.Motion.y *= 0.98F;
+        e.Motion.z *= 0.91F;
+
+        // Very simple ground collision
+        if (e.Pos.y <= 0) {
+            e.Pos.y = 0;
+            e.Motion.y = 0;
+            e.OnGround = true;
+
+            // Slight extra ground friction feel
+            e.Motion.x *= 0.6;
+            e.Motion.z *= 0.6;
+        } else {
+            e.OnGround = false;
+        }
+    }
+}
