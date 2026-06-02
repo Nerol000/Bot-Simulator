@@ -103,6 +103,10 @@ public class Main {
             if (prevAction == Action.JUMP) {
                 reward += 0.7;
             }
+            // Sprint-hit knockback bonus
+            if (s.sprinting) {
+                reward += 0.5;
+            }
         }
 
         // 4. Penalty for bad attack

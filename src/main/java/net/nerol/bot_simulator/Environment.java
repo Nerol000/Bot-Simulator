@@ -25,12 +25,18 @@ public class Environment {
         bot2.wasHit = false;
         stopMovement();
 
+        // Sticky sprint: cancel only on physically incompatible motion (backing up
+        // while running forward). Strafing, attacking, jumping, turning all keep sprint
+        // — the agent should be free to compose those with sustained forward motion.
+        if (action == Action.MOVE_BACK) {
+            bot1.sprinting = false;
+        }
+
         switch (action) {
-            case SPRINT:
-                setSprinting();
-                break;
+            case START_SPRINT:
+                bot1.sprinting = true;
             case MOVE_FORWARD:
-                setWalking();
+                if (!bot1.sprinting) setWalking();
                 break;
 
             case MOVE_BACK:
@@ -68,6 +74,10 @@ public class Environment {
             case JUMP:
                 jump();
                 break;
+        }
+        // Sticky tick: re-apply sprint impulse along current yaw every tick while latched
+        if (bot1.sprinting) {
+            setSprinting();
         }
         updatebot2();
         physics.update(bot1);
@@ -147,8 +157,10 @@ public class Environment {
     }
 
     void stopMovement() {
+        // Reset horizontal velocity only. x and z are the horizontal axes; y is vertical (jump/gravity)
+        // and must persist across ticks so a jump can finish its arc instead of being clamped flat.
         bot1.Motion.x = 0;
-        bot1.Motion.y = 0;
+        bot1.Motion.z = 0;
     }
 
     void updatebot2() {
@@ -159,7 +171,7 @@ public class Environment {
     public State getCurrentState() {
         int distance = computeDistanceBucket();
         int direction = computeDirectionBucket();
-        return new State(distance, direction);
+        return new State(distance, direction, bot1.sprinting);
     }
 
     int computeDistanceBucket() {
