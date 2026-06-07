@@ -14,7 +14,7 @@ public class Gravity {
         e.Pos.z += e.Motion.z;
 
         // Gravity
-        if (!e.OnGround) {
+        if (!e.onGround) {
             e.Motion.y -= 0.08D;
         }
 
@@ -27,13 +27,13 @@ public class Gravity {
         if (e.Pos.y <= 0) {
             e.Pos.y = 0;
             e.Motion.y = 0;
-            e.OnGround = true;
+            e.onGround = true;
 
             // Slight extra ground friction feel
             e.Motion.x *= 0.6;
             e.Motion.z *= 0.6;
         } else {
-            e.OnGround = false;
+            e.onGround = false;
         }
     }
 }
