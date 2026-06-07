@@ -25,7 +25,6 @@ public class PvPBot {
     public byte SelectedItemSlot;
 
     public boolean onGround = true;
-    public boolean sprinting = false;
     public boolean wasHit = false;
     public int hurtTime = 0;
 
@@ -37,6 +36,12 @@ public class PvPBot {
     public Vec3 pendingKnockback = new Vec3();
 
     public Equipment equipment = new Equipment();
+
+    public boolean sprinting = false;
+    public boolean walking_forward = false;
+    public boolean strafing_left = false;
+    public boolean strafing_right = false;
+    public boolean walking_back = false;
 
 
     public float getYaw() {

@@ -11,7 +11,6 @@ public enum Action {
     TURN_RIGHT_45,
     TURN_LEFT_90,
     TURN_RIGHT_90,
-    JUMP,
-    LOOK_AT_OPPONENT
+    JUMP
 }
 

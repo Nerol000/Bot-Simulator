@@ -16,33 +16,40 @@ public class Environment {
     }
 
     public void executeAction(Action action) {
-
         System.out.printf(
                 "Before: player=(%.2f, %.2f) enemy=(%.2f, %.2f)%n",
                 bot1.Pos.x, bot1.Pos.z, bot2.Pos.x, bot2.Pos.z
         );
 
         bot2.wasHit = false;
-        stopMovement();
 
         switch (action) {
             case SPRINT:
-                setSprinting();
+                if (!bot1.walking_back) {
+                    bot1.sprinting = !bot1.sprinting;
+                }
                 break;
             case MOVE_FORWARD:
-                setWalking();
+                if (!bot1.sprinting) {
+                    bot1.walking_forward = !bot1.walking_forward;
+                }
                 break;
-
             case MOVE_BACK:
-                setBackward();
+                if (!bot1.walking_forward && !bot1.sprinting) {
+                    bot1.walking_back = !bot1.walking_back;
+                }
                 break;
 
             case STRAFE_LEFT:
-                setStrafeLeft();
+                if (!bot1.strafing_right) {
+                    bot1.strafing_left = !bot1.strafing_left;
+                }
                 break;
 
             case STRAFE_RIGHT:
-                setStrafeRight();
+                if (!bot1.strafing_left) {
+                    bot1.strafing_right = !bot1.strafing_right;
+                }
                 break;
 
             case ATTACK:
@@ -69,6 +76,13 @@ public class Environment {
                 jump();
                 break;
         }
+
+        if (bot1.sprinting) setSprinting();
+        if (bot1.walking_forward) setWalking();
+        if (bot1.walking_back) setBackward();
+        if (bot1.strafing_left) setStrafeLeft();
+        if (bot1.strafing_right) setStrafeRight();
+
         updatebot2();
         physics.update(bot1);
         physics.update(bot2);
@@ -81,31 +95,31 @@ public class Environment {
 
     // --- Your existing functions ---
     void setSprinting() {
-        double speed = 0.24;
+        double speed = 0.2806;
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw())) * speed;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw())) * speed;
     }
 
     void setWalking() {
-        double speed = 0.1;
+        double speed = 0.21585;
 
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw())) * speed;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw())) * speed;
     }
     void setBackward() {
-        double speed = -0.1;
+        double speed = -0.21585;
 
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw())) * speed;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw())) * speed;
     }
     void setStrafeLeft() {
-        double speed = 0.1;
+        double speed = 0.21585;
 
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw() - 90)) * speed;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw() - 90)) * speed;
     }
     void setStrafeRight() {
-        double speed = 0.1;
+        double speed = 0.21585;
 
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw() + 90)) * speed;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw() + 90)) * speed;
@@ -113,7 +127,7 @@ public class Environment {
     void attack() {
         double dist = distanceSquaredTobot2();
 
-        if (dist <= 9.0) { // attack range
+        if (dist <= 9.0) { // attack range (3^2)
             // apply knockback to bot2
             bot2.hurtTime = 5;
 
@@ -193,10 +207,14 @@ public class Environment {
         bot1.Motion.z = 0;
         bot1.Rotation.x = 0.0f;
         bot1.onGround = true;
-        bot1.sprinting = false;
         bot1.attackCharge = 1.0;
         bot1.sweepingAttack = false;
         bot1.wasHit = false;
+        bot1.sprinting = false;
+        bot1.walking_forward = false;
+        bot1.strafing_left = false;
+        bot1.strafing_right = false;
+        bot1.walking_back = false;
 
         bot1.equipment.SelectedItem = ItemType.DIAMOND_SWORD;
         bot1.equipment.head = ItemType.DIAMOND_HELMET;
@@ -213,10 +231,14 @@ public class Environment {
         bot2.Motion.z = 0;
         bot2.Rotation.x = 180;
         bot2.onGround = true;
-        bot2.sprinting = false;
         bot2.attackCharge = 1.0;
         bot2.sweepingAttack = false;
         bot2.wasHit = false;
+        bot2.sprinting = false;
+        bot2.walking_forward = false;
+        bot2.strafing_left = false;
+        bot2.strafing_right = false;
+        bot2.walking_back = false;
 
         bot2.equipment.SelectedItem = ItemType.DIAMOND_SWORD;
         bot2.equipment.head = ItemType.DIAMOND_HELMET;

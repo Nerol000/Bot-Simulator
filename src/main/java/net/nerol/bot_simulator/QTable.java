@@ -4,13 +4,13 @@ import java.util.Random;
 
 public class QTable {
     private double[][] q;
-    private int numStates = 24;
-    private int numActions = Action.values().length;
+    private final int numStates = 48;
+    private final int numActions = Action.values().length;
 
-    private double learningRate = 0.1;
-    private double discountFactor = 0.9;
+    private final double learningRate = 0.1;
+    private final double discountFactor = 0.9;
 
-    private Random random = new Random();
+    private final Random random = new Random();
 
     public QTable() {
         q = new double[numStates][numActions];
