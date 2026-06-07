@@ -2,6 +2,7 @@ package net.nerol.bot_simulator.minecraft.world.entity;
 
 import net.nerol.bot_simulator.minecraft.util.Vec2;
 import net.nerol.bot_simulator.minecraft.util.Vec3;
+import net.nerol.bot_simulator.minecraft.world.entity.ai.attributes.Attributes;
 import net.nerol.bot_simulator.minecraft.world.item.ItemType;
 import net.nerol.bot_simulator.minecraft.world.item.equipment.Equipment;
 
@@ -10,7 +11,6 @@ public class PvPBot {
     public Vec3 Motion = new Vec3();
 
     public Vec2 Rotation = new Vec2();
-    public boolean OnGround;
 
     public int attackCooldown;
 
@@ -36,6 +36,7 @@ public class PvPBot {
     public Vec3 pendingKnockback = new Vec3();
 
     public Equipment equipment = new Equipment();
+    public Attributes attributes = new Attributes();
 
     public boolean sprinting = false;
     public boolean walking_forward = false;
