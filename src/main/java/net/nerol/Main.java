@@ -15,8 +15,7 @@ public class Main {
         Agent agent = new Agent(qTable);
         Environment env = new Environment();
 
-        try
-        {
+        try {
             PrintWriter writer =
                     new PrintWriter(
                             new FileWriter("bot_replay.csv")
@@ -28,7 +27,8 @@ public class Main {
                             + "distance,direction,stateIndex,"
                             + "action,reward"
             );
-            for (int episode = 0; episode < 100; episode++) {
+            for (int episode = 0; episode < 1000; episode++) {
+                env.reset();
                 double totalReward = 0;
                 State state = env.getCurrentState();
 
@@ -40,7 +40,7 @@ public class Main {
 
                     State nextState = env.getCurrentState();
 
-                    double reward = computeReward(state, action, nextState, prevAction);
+                    double reward = computeReward(state, action, nextState, prevAction, env);
 
                     agent.learn(state, action, reward, nextState);
 
@@ -68,8 +68,11 @@ public class Main {
 
                             action,
                             reward
-                            );
+                    );
                     state = nextState;
+                    prevAction = action;
+
+                    if (env.isEpisodeOver()) break;
                 }
                 System.out.println("Episode " + episode + " total reward = " + totalReward);
             }
@@ -77,9 +80,14 @@ public class Main {
         } catch (Exception e) {
             e.printStackTrace();
         }
+
+        // Persist the trained Q-table for the mod to load. The replay CSV above is
+        // kept too — it's useful for debugging individual transitions even after the
+        // policy ships.
+        qTable.save("qtable.csv");
     }
 
-    static double computeReward(State s, Action a, State s2, Action prevAction) {
+    static double computeReward(State s, Action a, State s2, Action prevAction, Environment env) {
 
         double reward = 0.0;
 
@@ -99,8 +107,9 @@ public class Main {
                 isFacingFront(s.direction)) // FRONT
         {
             reward += 1.5;
-            // Critical hit bonus
-            if (prevAction == Action.JUMP) {
+            // Critical hit bonus — MC crit requires airborne (mid-jump or falling)
+            // AND not sprinting. Sprint and crit are mutually exclusive in modern MC.
+            if (!env.bot1.onGround && !env.bot1.sprinting) {
                 reward += 0.7;
             }
         }
@@ -119,6 +128,26 @@ public class Main {
         // 6. Small penalty for turning (encourage efficiency)
         if (a.name().startsWith("TURN")) {
             reward -= 0.05;
+        }
+
+        // 7. Landed a real hit (verified post-tick, independent of state proxy in #3)
+        if (env.bot2.wasHit) {
+            reward += 1.0;
+        }
+
+        // 8. Took a real hit — teaches defensive play
+        if (env.bot1.wasHit) {
+            reward -= 0.7;
+        }
+
+        // 9. Terminal: killed opponent
+        if (env.bot2.Health <= 0) {
+            reward += 10.0;
+        }
+
+        // 10. Terminal: died
+        if (env.bot1.Health <= 0) {
+            reward -= 10.0;
         }
 
         return reward;
