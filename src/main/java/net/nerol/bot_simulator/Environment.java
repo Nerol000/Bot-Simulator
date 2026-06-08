@@ -30,10 +30,10 @@ public class Environment {
     }
 
     public void executeAction(Action action) {
-        System.out.printf(
+        /*System.out.printf(
                 "Before: player=(%.2f, %.2f) enemy=(%.2f, %.2f)%n",
                 bot1.Pos.x, bot1.Pos.z, bot2.Pos.x, bot2.Pos.z
-        );
+        );*/
 
         // Clear both per-tick hit flags; they get set true again only if a hit lands this tick.
         bot1.wasHit = false;
@@ -103,10 +103,10 @@ public class Environment {
         physics.update(bot1);
         physics.update(bot2);
 
-        System.out.printf(
+        /*System.out.printf(
                 "After: player=(%.2f, %.2f) enemy=(%.2f, %.2f)%n",
                 bot1.Pos.x, bot1.Pos.z, bot2.Pos.x, bot2.Pos.z
-        );
+        );*/
     }
 
     // --- Movement impulses driven by the MOVEMENT_SPEED attribute ---
@@ -211,7 +211,6 @@ public class Environment {
             double damageTaken = rawDamage * bot1.equipment.getProtectionDamageMultiplier();
             bot1.Health -= (float) damageTaken;
 
-            // MC-faithful knockback (same path bot1 uses to hit bot2).
             physics.getKnockbackSystem().applyAttackKnockback(bot2, bot1);
         }
 

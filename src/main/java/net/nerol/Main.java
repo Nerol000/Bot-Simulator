@@ -27,32 +27,39 @@ public class Main {
                             + "distance,direction,stateIndex,"
                             + "action,reward"
             );
-            for (int episode = 0; episode < 1000; episode++) {
+            for (int episode = 0; episode < 1000000; episode++) {
                 env.reset();
                 double totalReward = 0;
                 State state = env.getCurrentState();
 
-                for (int step = 0; step < 300; step++) {
+                for (int step = 0; step < 250; step++) {
 
                     Action action = agent.chooseAction(state);
+
+                    // Snapshot HP before the tick so we can derive per-tick damage deltas.
+                    float bot2HealthBefore = env.bot2.Health;
+                    float bot1HealthBefore = env.bot1.Health;
 
                     env.executeAction(action);
 
                     State nextState = env.getCurrentState();
 
-                    double reward = computeReward(state, action, nextState, prevAction, env);
+                    double damageDealt = Math.max(0.0, bot2HealthBefore - env.bot2.Health);
+                    double damageTaken = Math.max(0.0, bot1HealthBefore - env.bot1.Health);
+
+                    double reward = computeReward(state, action, nextState, prevAction, env, damageDealt, damageTaken);
 
                     agent.learn(state, action, reward, nextState);
 
                     totalReward += reward;
-                    System.out.printf(
+                    /*System.out.printf(
                             "Action=%s reward=%.3f dist=%d nextDist=%d hit=%b%n",
                             action,
                             reward,
                             state.distance,
                             nextState.distance,
                             env.bot2.wasHit
-                    );
+                    );*/
                     writer.printf(
                             "%d,%d, %.3f,%.3f,%.3f, %.3f,%.3f,%.3f, %d,%d,%d, %s,%.3f%n",
 
@@ -87,7 +94,8 @@ public class Main {
         qTable.save("qtable.csv");
     }
 
-    static double computeReward(State s, Action a, State s2, Action prevAction, Environment env) {
+    static double computeReward(State s, Action a, State s2, Action prevAction, Environment env,
+                                double damageDealt, double damageTaken) {
 
         double reward = 0.0;
 
@@ -101,51 +109,36 @@ public class Main {
             reward += 0.3;
         }
 
-        // 3. Big reward for correct attack
-        if (a == Action.ATTACK &&
-                s.distance == 0 && // NEAR
-                isFacingFront(s.direction)) // FRONT
-        {
-            reward += 1.5;
-            // Critical hit bonus — MC crit requires airborne (mid-jump or falling)
-            // AND not sprinting. Sprint and crit are mutually exclusive in modern MC.
-            if (!env.bot1.onGround && !env.bot1.sprinting) {
-                reward += 0.7;
-            }
-        }
-
-        // 4. Penalty for bad attack
+        // 3. Penalty for bad attack — wasted swing in the wrong context
         if (a == Action.ATTACK &&
                 !(s.distance == 0 && isFacingFront(s.direction))) {
             reward -= 0.5;
         }
 
-        // 5. Discourage spam jump
-        if (a == Action.JUMP) {
-            reward -= 0.02;
-        }
+        // 4. Discourage spam jump
+        //if (a == Action.JUMP) {
+        //    reward -= 0.02;
+        //}
 
-        // 6. Small penalty for turning (encourage efficiency)
+        // 5. Small penalty for turning (encourage efficiency)
         if (a.name().startsWith("TURN")) {
             reward -= 0.05;
         }
 
-        // 7. Landed a real hit (verified post-tick, independent of state proxy in #3)
-        if (env.bot2.wasHit) {
-            reward += 1.0;
-        }
+        // 6. Reward damage dealt to opponent (1 reward per HP). Naturally scales with
+        //    crits (1.5x), Sharpness, and Protection on the target — those all move
+        //    the underlying damage number, which propagates here.
+        reward += damageDealt;
 
-        // 8. Took a real hit — teaches defensive play
-        if (env.bot1.wasHit) {
-            reward -= 0.7;
-        }
+        // 7. Punish damage taken (1 penalty per HP).
+        reward -= damageTaken;
 
-        // 9. Terminal: killed opponent
+        // 8. Terminal: killed opponent
         if (env.bot2.Health <= 0) {
             reward += 10.0;
         }
 
-        // 10. Terminal: died
+        // 9. Terminal: died
         if (env.bot1.Health <= 0) {
             reward -= 10.0;
         }
@@ -165,5 +158,4 @@ public class Main {
     static boolean isCloserToFront(int d1, int d2) {
         return distanceToFront(d2) < distanceToFront(d1);
     }
-
 }
