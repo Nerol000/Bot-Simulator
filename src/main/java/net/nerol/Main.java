@@ -27,7 +27,7 @@ public class Main {
                             + "distance,direction,stateIndex,"
                             + "action,reward"
             );
-            for (int episode = 0; episode < 1000000; episode++) {
+            for (int episode = 0; episode < 100000; episode++) {
                 env.reset();
                 double totalReward = 0;
                 State state = env.getCurrentState();
@@ -112,7 +112,7 @@ public class Main {
         // 3. Penalty for bad attack — wasted swing in the wrong context
         if (a == Action.ATTACK &&
                 !(s.distance == 0 && isFacingFront(s.direction))) {
-            reward -= 0.5;
+            reward -= 0.3;
         }
 
         // 4. Discourage spam jump
@@ -131,16 +131,16 @@ public class Main {
         reward += damageDealt;
 
         // 7. Punish damage taken (1 penalty per HP).
-        reward -= damageTaken;
+        reward -= damageTaken * 0.8;
 
         // 8. Terminal: killed opponent
         if (env.bot2.Health <= 0) {
-            reward += 10.0;
+            reward += 20.0;
         }
 
         // 9. Terminal: died
         if (env.bot1.Health <= 0) {
-            reward -= 10.0;
+            reward -= 20.0;
         }
 
         return reward;

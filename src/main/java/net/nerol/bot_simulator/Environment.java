@@ -202,19 +202,25 @@ public class Environment {
         bot2.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
 
         // Enforce bot2's own attack cooldown so it can't spam.
-        if (bot2.attackCharge < 1.0) return;
+        if (bot2.attackCharge >= 0.32) {
+            bot2.sprinting = true;
+            bot2.walking_back = false;
+        }
 
         double dist2 = dx * dx + dz * dz;
-        if (dist2 <= 9.0) { // attack range (3^2)
+        if (dist2 <= 9.0 && bot2.attackCharge > 0.8) { // attack range (3^2)
             // Damage = bot2's sword (+ Sharpness) * bot1's Protection multiplier.
             double rawDamage = bot2.equipment.SelectedItem.getAttackDamage();
             double damageTaken = rawDamage * bot1.equipment.getProtectionDamageMultiplier();
             bot1.Health -= (float) damageTaken;
 
             physics.getKnockbackSystem().applyAttackKnockback(bot2, bot1);
-        }
 
-        bot2.attackCharge = 0.0;
+            bot2.attackCharge = 0.0;
+
+            bot2.walking_back = true;
+            bot2.sprinting = false;
+        }
     }
 
     /** Episode is over when either bot has been reduced to 0 HP. */
@@ -236,8 +242,8 @@ public class Environment {
         double dz = bot2.Pos.z - bot1.Pos.z;
         double dist = Math.sqrt(dx * dx + dz * dz);
 
-        if (dist < 5) return 0;
-        if (dist < 10) return 1;
+        if (dist < 1.66) return 0;
+        if (dist <= 3) return 1;
         return 2;
     }
     int computeDirectionBucket() {
