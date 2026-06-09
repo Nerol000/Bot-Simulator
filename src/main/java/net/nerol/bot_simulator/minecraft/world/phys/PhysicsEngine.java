@@ -12,10 +12,8 @@ public class PhysicsEngine {
     }
 
     public void update(PvPBot e) {
-        // first apply pending knockback impulses into velocity
-        knockbackSystem.applyPendingKnockback(e);
-
-        // then run position/gravity/drag
+        // Knockback is now applied to velocity immediately at hit time (see
+        // Knockback.applyHitKnockback), so here we just run position/gravity/drag.
         gravitySystem.apply(e);
 
         if (e.hurtTime > 0) {

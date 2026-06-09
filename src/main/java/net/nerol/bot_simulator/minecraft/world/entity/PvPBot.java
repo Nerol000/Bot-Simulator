@@ -32,9 +32,6 @@ public class PvPBot {
     public double attackCharge = 1.0;   // 0.0 to 1.0
     public boolean sweepingAttack = false;
 
-    // pending knockback impulse
-    public Vec3 pendingKnockback = new Vec3();
-
     public Equipment equipment = new Equipment();
     public Attributes attributes = new Attributes();
 
