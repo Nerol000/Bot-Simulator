@@ -8,6 +8,8 @@ import net.nerol.bot_simulator.minecraft.world.item.enchantments.Enchantment;
 import net.nerol.bot_simulator.minecraft.world.item.enchantments.EnchantmentType;
 import net.nerol.bot_simulator.minecraft.world.phys.PhysicsEngine;
 
+import java.util.Random;
+
 public class Environment {
     // MC's MOVEMENT_SPEED attribute (default 0.1) corresponds to ~0.21585 blocks/tick
     // walking equilibrium under 0.91 horizontal friction. Per-tick impulse therefore
@@ -136,34 +138,76 @@ public class Environment {
         bot1.Motion.x += Math.cos(Math.toRadians(bot1.getYaw() + 90)) * impulse;
         bot1.Motion.z += Math.sin(Math.toRadians(bot1.getYaw() + 90)) * impulse;
     }
+
     void attack() {
-        // Enforce per-weapon cooldown: an early swing is dropped (matches MC's
-        // attack-cooldown UX). When the swing does fire it consumes the charge
-        // regardless of whether it connects.
-        if (bot1.attackCharge < 1.0) {
+        performAttack(bot1, bot2);
+    }
+
+    /** Faithful port of the mod's {@code PvPBot.attack(Entity)}: attack-strength scaling,
+     *  separate physical vs. enchantment (Sharpness) damage, full-strength gating, critical
+     *  hits, and the sprint knockback bonus. The deployed bot (ActionPack.leftClick) only
+     *  swings at strength > 0.9, and an out-of-reach swing hits air without consuming the
+     *  cooldown — both mirrored here. */
+    void performAttack(PvPBot attacker, PvPBot defender) {
+        // attackStrengthScale = getAttackStrengthScale(0.5F): cooldown charge in [0,1].
+        double scale = Math.max(0.0, Math.min(1.0, attacker.attackCharge));
+
+        boolean fullStrengthAttack = scale > 0.9;
+        if (!fullStrengthAttack) {
+            return; // leftClick drops a non-full swing before it even swings.
+        }
+
+        // Out of melee reach (3 blocks): a swing at air — no damage, cooldown not consumed.
+        double ddx = defender.Pos.x - attacker.Pos.x;
+        double ddz = defender.Pos.z - attacker.Pos.z;
+        if (ddx * ddx + ddz * ddz > 9.0) {
             return;
         }
 
-        double dist = distanceSquaredTobot2();
+        // baseDamage = weapon's physical ATTACK_DAMAGE; magicBoost = the Sharpness portion,
+        // scaled by attack strength (getEnchantedDamage - baseDamage).
+        double baseDamage = attacker.equipment.SelectedItem.type.attackDamage;
+        double enchantedDamage = attacker.equipment.SelectedItem.getAttackDamage();
+        double magicBoost = scale * (enchantedDamage - baseDamage);
 
-        if (dist <= 9.0) { // attack range (3^2)
-            // Damage = weapon's attack damage (base + Sharpness bonus)
-            // scaled by defender's Protection multiplier.
-            double rawDamage = bot1.equipment.SelectedItem.getAttackDamage();
-            // Critical hit: 1.5x damage when airborne AND not sprinting (MC rule).
-            if (!bot1.onGround && !bot1.sprinting) {
-                rawDamage *= 1.5;
-            }
-            double damageTaken = rawDamage * bot2.equipment.getProtectionDamageMultiplier();
-            bot2.Health -= (float)damageTaken;
+        // Cooldown ramp on the physical portion: baseDamageScaleFactor() = 0.2 + 0.8*scale^2.
+        baseDamage *= 0.2 + 0.8 * scale * scale;
 
-            // MC-faithful knockback: base 0.4, +0.5 if sprinting, +0.5/level Knockback,
-            // multiplied by (1 - defender's KNOCKBACK_RESISTANCE). Sets hurtTime/wasHit.
-            physics.getKnockbackSystem().applyAttackKnockback(bot1, bot2);
+        boolean knockbackAttack = attacker.sprinting && fullStrengthAttack;
+
+        // Critical hit multiplies ONLY the physical portion; magicBoost is added afterwards.
+        boolean criticalAttack = fullStrengthAttack && canCriticalAttack(attacker);
+        if (criticalAttack) {
+            baseDamage *= 1.5;
         }
 
-        // Cooldown starts on swing, hit or miss.
-        bot1.attackCharge = 0.0;
+        double totalDamage = baseDamage + magicBoost;
+
+        // hurtOrSimulate analogue: reduce by the defender's Protection multiplier.
+        double damageTaken = totalDamage * defender.equipment.getProtectionDamageMultiplier();
+        if (damageTaken > 0.0) {
+            defender.Health -= (float) damageTaken;
+
+            // causeExtraKnockback amount = Knockback-enchant + (sprint ? 0.5 : 0). The base
+            // 0.4 hit reaction is applied inside the knockback system.
+            double enchantKnockback =
+                    attacker.equipment.SelectedItem.getEnchantmentLevel(EnchantmentType.KNOCKBACK) * 0.5;
+            double extraKnockback = enchantKnockback + (knockbackAttack ? 0.5 : 0.0);
+            physics.getKnockbackSystem().applyHitKnockback(attacker, defender, extraKnockback);
+        }
+
+        // resetAttackStrengthTicker: the charge is consumed only on a real (in-reach) attack.
+        attacker.attackCharge = 0.0;
+    }
+
+    /** Subset of the mod's {@code canCriticalAttack} the simulator can observe: the attacker
+     *  must be descending (fall_distance > 0), airborne, and not sprinting. The remaining
+     *  guards (not on a ladder / in water / a passenger; target is a LivingEntity) always
+     *  hold in this 1v1 setup. */
+    boolean canCriticalAttack(PvPBot attacker) {
+        return attacker.fall_distance > 0.0f
+                && !attacker.onGround
+                && !attacker.sprinting;
     }
     void jump() {
         if (bot1.onGround) {
@@ -191,35 +235,60 @@ public class Environment {
         bot1.Motion.y = 0;
     }
 
+    // --- bot2 s-tap combo state ---
+    // Ticks remaining in the post-hit backward tap. The s-tap is a brief retreat between
+    // hits that keeps bot2 from overshooting bot1 while its attack recharges, then lets it
+    // sprint back in so every re-approach lands a fresh sprint-knockback hit.
+    private int bot2StapTicks = 0;
+
+    private static final double S_TAP_MEAN = 3;
+    private static final double S_TAP_STDDEV = 0.75;
+    private static final int S_TAP_MAX = 5;
+    private static final long S_TAP_SEED = 42L;
+    private final Random random = new Random(S_TAP_SEED);
+
     void updatebot2() {
-        // Reactive trainer: bot2 always tracks bot1 and swings when in range + charged.
-        // No movement, no strafing — bot1 has to learn against a present-but-predictable
-        // attacker. Once policy stabilizes, swap this for a smarter opponent.
+        // S-tapping combo trainer: bot2 sprint-chases bot1, lands a sprint-knockback hit,
+        // then taps backward for a couple ticks (the s-tap) before sprinting back in —
+        // keeping bot1 pinned in a knockback loop. Damage, criticals and the +0.5 sprint-
+        // knockback bonus all run through performAttack, exactly as bot1's attacks do.
+        // bot2's movement is applied inline here so this stays self-contained to bot2.
 
         // Face bot1 every tick.
         double dx = bot1.Pos.x - bot2.Pos.x;
         double dz = bot1.Pos.z - bot2.Pos.z;
         bot2.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
+        double yaw = Math.toRadians(bot2.getYaw());
 
-        // Enforce bot2's own attack cooldown so it can't spam.
-        if (bot2.attackCharge >= 0.32) {
+        double walkImpulse = bot2.attributes.get(AttributeType.MOVEMENT_SPEED) * WALK_IMPULSE_PER_SPEED;
+        if (bot2StapTicks > 0) {
+            // Post-hit s-tap: walk backward briefly. The landed hit's knockback already
+            // cleared bot2's sprint, so this just spaces the approach and re-times the next
+            // sprint-in to arrive in reach right as the attack finishes recharging.
+            bot2StapTicks--;
+            bot2.sprinting = false;
+            bot2.walking_back = true;
+            bot2.Motion.x -= Math.cos(yaw) * walkImpulse;
+            bot2.Motion.z -= Math.sin(yaw) * walkImpulse;
+        } else {
+            // Chase: sprint straight at bot1 to close and hold melee reach. sprinting must
+            // be true at swing time for performAttack to add the +0.5 sprint-knockback bonus.
             bot2.sprinting = true;
             bot2.walking_back = false;
+            double sprintImpulse = walkImpulse * SPRINT_MULTIPLIER;
+            bot2.Motion.x += Math.cos(yaw) * sprintImpulse;
+            bot2.Motion.z += Math.sin(yaw) * sprintImpulse;
         }
 
-        double dist2 = dx * dx + dz * dz;
-        if (dist2 <= 9.0 && bot2.attackCharge > 0.8) { // attack range (3^2)
-            // Damage = bot2's sword (+ Sharpness) * bot1's Protection multiplier.
-            double rawDamage = bot2.equipment.SelectedItem.getAttackDamage();
-            double damageTaken = rawDamage * bot1.equipment.getProtectionDamageMultiplier();
-            bot1.Health -= (float) damageTaken;
-
-            physics.getKnockbackSystem().applyAttackKnockback(bot2, bot1);
-
-            bot2.attackCharge = 0.0;
-
-            bot2.walking_back = true;
-            bot2.sprinting = false;
+        // Swing with the faithful combat rules (reach + full-strength gating, knockback).
+        // performAttack consumes the charge only on a real in-reach hit, so a drop in the
+        // charge tells us a hit just landed — that kicks off the next s-tap.
+        double chargeBeforeSwing = bot2.attackCharge;
+        performAttack(bot2, bot1);
+        if (bot2.attackCharge < chargeBeforeSwing) {
+            // Jittered s-tap length: round a Gaussian draw and clamp to [0, S_TAP_MAX].
+            double sampled = S_TAP_MEAN + random.nextGaussian() * S_TAP_STDDEV;
+            bot2StapTicks = (int) Math.round(Math.max(1.0, Math.min(S_TAP_MAX, sampled)));
         }
     }
 
@@ -242,7 +311,7 @@ public class Environment {
         double dz = bot2.Pos.z - bot1.Pos.z;
         double dist = Math.sqrt(dx * dx + dz * dz);
 
-        if (dist < 1.66) return 0;
+        if (dist < 1.66666) return 0;
         if (dist <= 3) return 1;
         return 2;
     }
@@ -282,11 +351,11 @@ public class Environment {
         bot1.walking_back = false;
 
         bot1.Health = 20.0f;
-        bot1.equipment.SelectedItem = new ItemStack(ItemType.DIAMOND_SWORD, new Enchantment(EnchantmentType.SHARPNESS, 2));
-        bot1.equipment.head  = new ItemStack(ItemType.DIAMOND_HELMET,     new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot1.equipment.chest = new ItemStack(ItemType.DIAMOND_CHESTPLATE, new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot1.equipment.leg   = new ItemStack(ItemType.DIAMOND_LEGGINGS,   new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot1.equipment.feet  = new ItemStack(ItemType.DIAMOND_BOOTS,      new Enchantment(EnchantmentType.PROTECTION, 3));
+        bot1.equipment.SelectedItem = new ItemStack(ItemType.DIAMOND_SWORD);
+        bot1.equipment.head  = new ItemStack(ItemType.DIAMOND_HELMET,     new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot1.equipment.chest = new ItemStack(ItemType.DIAMOND_CHESTPLATE, new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot1.equipment.leg   = new ItemStack(ItemType.DIAMOND_LEGGINGS,   new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot1.equipment.feet  = new ItemStack(ItemType.DIAMOND_BOOTS,      new Enchantment(EnchantmentType.PROTECTION, 4));
         resetAttributesFromEquipment(bot1);
 
         // bot2
@@ -308,11 +377,11 @@ public class Environment {
         bot2.walking_back = false;
 
         bot2.Health = 20.0f;
-        bot2.equipment.SelectedItem = new ItemStack(ItemType.DIAMOND_SWORD, new Enchantment(EnchantmentType.SHARPNESS, 2));
-        bot2.equipment.head  = new ItemStack(ItemType.DIAMOND_HELMET,     new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot2.equipment.chest = new ItemStack(ItemType.DIAMOND_CHESTPLATE, new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot2.equipment.leg   = new ItemStack(ItemType.DIAMOND_LEGGINGS,   new Enchantment(EnchantmentType.PROTECTION, 3));
-        bot2.equipment.feet  = new ItemStack(ItemType.DIAMOND_BOOTS,      new Enchantment(EnchantmentType.PROTECTION, 3));
+        bot2.equipment.SelectedItem = new ItemStack(ItemType.DIAMOND_SWORD);
+        bot2.equipment.head  = new ItemStack(ItemType.DIAMOND_HELMET,     new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot2.equipment.chest = new ItemStack(ItemType.DIAMOND_CHESTPLATE, new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot2.equipment.leg   = new ItemStack(ItemType.DIAMOND_LEGGINGS,   new Enchantment(EnchantmentType.PROTECTION, 4));
+        bot2.equipment.feet  = new ItemStack(ItemType.DIAMOND_BOOTS,      new Enchantment(EnchantmentType.PROTECTION, 4));
         resetAttributesFromEquipment(bot2);
     }
 

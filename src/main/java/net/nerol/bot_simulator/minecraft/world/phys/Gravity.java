@@ -13,9 +13,15 @@ public class Gravity {
         e.Pos.y += e.Motion.y;
         e.Pos.z += e.Motion.z;
 
+        // Track fall distance while descending; it gates critical hits (canCriticalAttack
+        // requires fall_distance > 0). Accumulates only on the way down, reset on landing.
+        if (!e.onGround && e.Motion.y < 0) {
+            e.fall_distance += (float) (-e.Motion.y);
+        }
+
         // Gravity
         if (!e.onGround) {
-            e.Motion.y -= 0.08D;
+            e.Motion.y -= GRAVITY;
         }
 
         // Drag
@@ -28,6 +34,7 @@ public class Gravity {
             e.Pos.y = 0;
             e.Motion.y = 0;
             e.onGround = true;
+            e.fall_distance = 0;
 
             // Slight extra ground friction feel
             e.Motion.x *= 0.6;

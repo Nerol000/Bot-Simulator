@@ -16,9 +16,9 @@ public class Main {
         Environment env = new Environment();
 
         try {
-            PrintWriter writer =
+            /*PrintWriter writer =
                     new PrintWriter(
-                            new FileWriter("bot_replay.csv")
+                            new FileWriter("replay.csv")
                     );
             writer.println(
                     "episode,step,"
@@ -26,13 +26,13 @@ public class Main {
                             + "enemyX,enemyY,enemyZ,"
                             + "distance,direction,stateIndex,"
                             + "action,reward"
-            );
-            for (int episode = 0; episode < 100000; episode++) {
+            );*/
+            for (int episode = 0; episode < 1100100; episode++) {
                 env.reset();
                 double totalReward = 0;
                 State state = env.getCurrentState();
 
-                for (int step = 0; step < 250; step++) {
+                for (int step = 0; step < 1200; step++) { // 60 sec duel
 
                     Action action = agent.chooseAction(state);
 
@@ -60,7 +60,7 @@ public class Main {
                             nextState.distance,
                             env.bot2.wasHit
                     );*/
-                    writer.printf(
+                    /*writer.printf(
                             "%d,%d, %.3f,%.3f,%.3f, %.3f,%.3f,%.3f, %d,%d,%d, %s,%.3f%n",
 
                             episode, step,
@@ -75,15 +75,15 @@ public class Main {
 
                             action,
                             reward
-                    );
+                    );*/
                     state = nextState;
                     prevAction = action;
 
                     if (env.isEpisodeOver()) break;
                 }
-                System.out.println("Episode " + episode + " total reward = " + totalReward);
+                if (episode % 100 == 0) System.out.println("Episode " + episode + " total reward = " + totalReward);
             }
-            writer.close();
+            //writer.close();
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -100,19 +100,19 @@ public class Main {
         double reward = 0.0;
 
         // 1. Reward getting closer to FRONT
-        if (isCloserToFront(s.direction, s2.direction)) {
-            reward += 0.2;
-        }
+//        if (isCloserToFront(s.direction, s2.direction)) {
+//            reward += 0.02;
+//        }
 
         // 2. Reward getting closer in distance
         if (s2.distance < s.distance) {
-            reward += 0.3;
+            reward += 0.05;
         }
 
         // 3. Penalty for bad attack — wasted swing in the wrong context
         if (a == Action.ATTACK &&
                 !(s.distance == 0 && isFacingFront(s.direction))) {
-            reward -= 0.3;
+            reward -= 0.1;
         }
 
         // 4. Discourage spam jump
@@ -122,7 +122,7 @@ public class Main {
 
         // 5. Small penalty for turning (encourage efficiency)
         if (a.name().startsWith("TURN")) {
-            reward -= 0.05;
+            reward -= 0.01;
         }
 
         // 6. Reward damage dealt to opponent (1 reward per HP). Naturally scales with
@@ -131,7 +131,7 @@ public class Main {
         reward += damageDealt;
 
         // 7. Punish damage taken (1 penalty per HP).
-        reward -= damageTaken * 0.8;
+        reward -= damageTaken * 0.75;
 
         // 8. Terminal: killed opponent
         if (env.bot2.Health <= 0) {

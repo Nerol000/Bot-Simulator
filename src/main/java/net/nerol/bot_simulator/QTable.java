@@ -8,7 +8,7 @@ import java.util.Random;
 
 public class QTable {
     private double[][] q;
-    private final int numStates = 48;
+    private final int numStates = 24;
     private final int numActions = Action.values().length;
 
     private final double learningRate = 0.1;
