@@ -7,6 +7,7 @@ import net.nerol.bot_simulator.minecraft.world.item.ItemType;
 import net.nerol.bot_simulator.minecraft.world.item.enchantments.Enchantment;
 import net.nerol.bot_simulator.minecraft.world.item.enchantments.EnchantmentType;
 import net.nerol.bot_simulator.minecraft.world.phys.PhysicsEngine;
+import net.nerol.bot_simulator.minecraft.world.phys.RayTrace;
 
 import java.util.Random;
 
@@ -157,10 +158,11 @@ public class Environment {
             return; // leftClick drops a non-full swing before it even swings.
         }
 
-        // Out of melee reach (3 blocks): a swing at air — no damage, cooldown not consumed.
-        double ddx = defender.Pos.x - attacker.Pos.x;
-        double ddz = defender.Pos.z - attacker.Pos.z;
-        if (ddx * ddx + ddz * ddz > 9.0) {
+        // Entity-pick raycast (mirrors ActionPack.leftClick): the swing only lands if a ray
+        // from the attacker's eye along its look direction clips the defender's hitbox within
+        // reach. A swing at air — out of range OR not aimed at the target — hits nothing and
+        // (as before) does not consume the cooldown.
+        if (!RayTrace.canHit(attacker, defender)) {
             return;
         }
 
@@ -223,11 +225,11 @@ public class Environment {
 
     void lookAt(PvPBot self, PvPBot target) {
         double dx = target.Pos.x - self.Pos.x;
+        double dy = target.Pos.y - self.Pos.y;
         double dz = target.Pos.z - self.Pos.z;
 
-        double angle = Math.toDegrees(Math.atan2(dz, dx));
-
-        self.Rotation.x = (float)angle;
+        self.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
+        self.Rotation.y = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
     }
 
     void stopMovement() {
@@ -254,10 +256,15 @@ public class Environment {
         // knockback bonus all run through performAttack, exactly as bot1's attacks do.
         // bot2's movement is applied inline here so this stays self-contained to bot2.
 
-        // Face bot1 every tick.
+        // Face bot1 every tick. Yaw drives both movement and the attack ray; pitch keeps the
+        // ray aimed at bot1's hitbox when there's a vertical gap (e.g. bot1 jumps for a crit),
+        // so the 3D raytrace still lands. Movement impulses below use yaw only, so pitch is
+        // purely an aiming term.
         double dx = bot1.Pos.x - bot2.Pos.x;
+        double dy = bot1.Pos.y - bot2.Pos.y;
         double dz = bot1.Pos.z - bot2.Pos.z;
         bot2.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
+        bot2.Rotation.y = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
         double yaw = Math.toRadians(bot2.getYaw());
 
         double walkImpulse = bot2.attributes.get(AttributeType.MOVEMENT_SPEED) * WALK_IMPULSE_PER_SPEED;
@@ -305,11 +312,13 @@ public class Environment {
     }
 
     int computeDistanceBucket() {
-        // Distance from bot1 to bot2, not from world origin. Same convention the MC
-        // LiveController will use, so the Q-table transfers cleanly.
+        // Full 3D distance from bot1 to bot2, not from world origin. Includes the vertical
+        // gap so a jump/crit separation registers, matching the 3D entity-pick raytrace.
+        // Same convention the MC LiveController will use, so the Q-table transfers cleanly.
         double dx = bot2.Pos.x - bot1.Pos.x;
+        double dy = bot2.Pos.y - bot1.Pos.y;
         double dz = bot2.Pos.z - bot1.Pos.z;
-        double dist = Math.sqrt(dx * dx + dz * dz);
+        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
         if (dist < 1.66666) return 0;
         if (dist <= 3) return 1;
@@ -327,9 +336,10 @@ public class Environment {
     }
     double distanceSquaredTobot2() {
         double dx = bot2.Pos.x - bot1.Pos.x;
+        double dy = bot2.Pos.y - bot1.Pos.y;
         double dz = bot2.Pos.z - bot1.Pos.z;
 
-        return dx * dx + dz * dz;
+        return dx * dx + dy * dy + dz * dz;
     }
     public void reset() {
         // player
