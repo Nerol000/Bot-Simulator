@@ -278,8 +278,9 @@ public class Environment {
             bot2.Motion.x -= Math.cos(yaw) * walkImpulse;
             bot2.Motion.z -= Math.sin(yaw) * walkImpulse;
         } else {
-            // Chase: sprint straight at bot1 to close and hold melee reach. sprinting must
-            // be true at swing time for performAttack to add the +0.5 sprint-knockback bonus.
+            // Chase: keep sprinting straight at bot1 until the raytrace says we can connect.
+            // sprinting must be true at swing time for performAttack to add the +0.5 sprint-
+            // knockback bonus, so committing to the sprint-in is what locks in the combo.
             bot2.sprinting = true;
             bot2.walking_back = false;
             double sprintImpulse = walkImpulse * SPRINT_MULTIPLIER;
@@ -287,15 +288,18 @@ public class Environment {
             bot2.Motion.z += Math.sin(yaw) * sprintImpulse;
         }
 
-        // Swing with the faithful combat rules (reach + full-strength gating, knockback).
-        // performAttack consumes the charge only on a real in-reach hit, so a drop in the
-        // charge tells us a hit just landed — that kicks off the next s-tap.
-        double chargeBeforeSwing = bot2.attackCharge;
-        performAttack(bot2, bot1);
-        if (bot2.attackCharge < chargeBeforeSwing) {
-            // Jittered s-tap length: round a Gaussian draw and clamp to [0, S_TAP_MAX].
-            double sampled = S_TAP_MEAN + random.nextGaussian() * S_TAP_STDDEV;
-            bot2StapTicks = (int) Math.round(Math.max(1.0, Math.min(S_TAP_MAX, sampled)));
+        // Only swing once we can actually land it (in reach AND aimed) — the combo lock-in.
+        // Until then bot2 just keeps sprinting in above; no wasted swings at air. The first
+        // connecting sprint-hit consumes the charge (a drop signals the hit landed), which
+        // kicks off the s-tap and the knockback loop that sustains the combo.
+        if (RayTrace.canHit(bot2, bot1)) {
+            double chargeBeforeSwing = bot2.attackCharge;
+            performAttack(bot2, bot1);
+            if (bot2.attackCharge < chargeBeforeSwing) {
+                // Jittered s-tap length: round a Gaussian draw and clamp to [0, S_TAP_MAX].
+                double sampled = S_TAP_MEAN + random.nextGaussian() * S_TAP_STDDEV;
+                bot2StapTicks = (int) Math.round(Math.max(1.0, Math.min(S_TAP_MAX, sampled)));
+            }
         }
     }
 
