@@ -94,6 +94,13 @@ public class Environment {
             case JUMP:
                 jump();
                 break;
+
+            case LOOK_AT_TARGET:
+                // Snap aim straight at bot2 (exact yaw + pitch), bypassing the 45-degree turn
+                // quantization. This gives the agent a way to line up the narrow raycast hit
+                // cone before an ATTACK, which 45-degree turns alone can't reliably do.
+                lookAt(bot1, bot2);
+                break;
         }
 
         if (bot1.sprinting) setSprinting();

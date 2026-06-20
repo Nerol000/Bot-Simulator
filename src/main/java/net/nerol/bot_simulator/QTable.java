@@ -67,12 +67,18 @@ public class QTable {
 
     public Action getBestAction(int stateIndex) {
         double maxQ = Double.NEGATIVE_INFINITY;
-        int bestAction = 0;
-
         for (int a = 0; a < numActions; a++) {
-            if (q[stateIndex][a] > maxQ) {
-                maxQ = q[stateIndex][a];
-                bestAction = a;
+            if (q[stateIndex][a] > maxQ) maxQ = q[stateIndex][a];
+        }
+
+        // Break ties uniformly at random (reservoir pick over the arg-max set) so flat or
+        // never-visited states don't deterministically collapse to action 0 (SPRINT).
+        int count = 0;
+        int bestAction = 0;
+        for (int a = 0; a < numActions; a++) {
+            if (q[stateIndex][a] == maxQ) {
+                count++;
+                if (random.nextInt(count) == 0) bestAction = a;
             }
         }
         return Action.values()[bestAction];

@@ -19,8 +19,13 @@ public class Main {
         // Resume from the last checkpoint if one exists, so successive runs keep improving the
         // same table instead of restarting from all-zeros. Skipped cleanly on the first run.
         if (new java.io.File(CHECKPOINT_PATH).exists()) {
-            qTable.load(CHECKPOINT_PATH);
-            System.out.println("Resumed Q-table from " + CHECKPOINT_PATH);
+            try {
+                qTable.load(CHECKPOINT_PATH);
+                System.out.println("Resumed Q-table from " + CHECKPOINT_PATH);
+            } catch (RuntimeException e) {
+                // e.g. a dimension mismatch after the action set changed — start fresh.
+                System.out.println("Could not resume " + CHECKPOINT_PATH + " (" + e.getMessage() + "); starting fresh.");
+            }
         }
         Agent agent = new Agent(qTable);
         Environment env = new Environment();
@@ -98,7 +103,10 @@ public class Main {
 
                     if (env.isEpisodeOver()) break;
                 }
-                if (episode % 100 == 0) System.out.println("Episode " + episode + " total reward = " + totalReward);
+                agent.decayEpsilon();
+                if (episode % 100 == 0)
+                    System.out.printf("Episode %d total reward = %.2f (epsilon=%.3f)%n",
+                            episode, totalReward, agent.getEpsilon());
 
                 // Checkpoint on a cadence that widens as training progresses (see
                 // checkpointInterval): frequent early when the table changes fast, sparse late
