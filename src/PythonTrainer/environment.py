@@ -1,13 +1,18 @@
 """
-Duel environment for the neural-net trainer — a Python port of the Java
-`RL/Simulator/bot_simulator/Environment.java` (+ PhysicsEngine / Knockback / RayTrace
-and the bot2 s-tap AI), extended to a full 360-degree yaw + pitch action space.
+Self-play duel environment for the neural-net trainer (Python port of the Java sim, extended).
 
-bot1 is the learning agent; bot2 is the scripted s-tap opponent. Conventions match the
-Java sim: xz forward = (cos yaw, sin yaw); attacks are gated by an eye->look raytrace
-against the target's AABB, so the agent must actually aim (now in 3D) to land a hit.
+During training, bot1 and bot2 are BOTH driven externally by the policy (shared-policy self-play),
+so the opponent is always at the agent's own skill level — there is always a learnable gradient,
+unlike training against the fixed s-tap expert (which gives a cold-start agent no foothold).
+For *measuring* absolute progress, step_eval() pits the agent (bot1) against the scripted s-tap
+opponent as a fixed yardstick.
 
-The env is Gym-like: reset() -> obs, step(action) -> (obs, reward, done, info).
+Action space adds LOOK_AT_TARGET (snap exact aim) so hits are landable; full 360 yaw + pitch.
+
+Gym-like, symmetric:
+    reset() -> (obs1, obs2)
+    step(a1, a2)  -> (obs1, obs2, r1, r2, done, info)   # self-play (training)
+    step_eval(a1) -> (obs1, r1, done, info)             # vs scripted s-tap (evaluation)
 """
 
 import math
@@ -17,38 +22,44 @@ import numpy as np
 MOVEMENT_SPEED = 0.1
 WALK_IMPULSE_PER_SPEED = 0.1943
 SPRINT_MULTIPLIER = 1.3
-WALK_IMPULSE = MOVEMENT_SPEED * WALK_IMPULSE_PER_SPEED   # per-tick forward impulse
+WALK_IMPULSE = MOVEMENT_SPEED * WALK_IMPULSE_PER_SPEED
 
-H_FRICTION = 0.91          # horizontal ground friction
+H_FRICTION = 0.91
 GRAVITY = 0.08
 V_DRAG = 0.98
 JUMP_VELOCITY = 0.42
 
-REACH = 3.0                # ENTITY_INTERACTION_RANGE
+REACH = 3.0
 PLAYER_WIDTH = 0.6
 PLAYER_HEIGHT = 1.8
 EYE_HEIGHT = 1.62
 
-ATTACK_DAMAGE = 7.0                 # diamond sword physical damage
-CHARGE_PER_TICK = 1.0 / 12.5        # diamond sword attack speed (~1.6/s -> full in 12.5 ticks)
+ATTACK_DAMAGE = 7.0
+CHARGE_PER_TICK = 1.0 / 12.5
 FULL_STRENGTH = 0.9
-# Net damage multiplier of full diamond armor + Protection IV (approximate; the Java sim
-# computes this from the Equipment, here it's a constant so a clean hit deals ~2 HP).
 PROTECTION_MULT = 0.30
 BASE_KNOCKBACK = 0.4
 SPRINT_KNOCKBACK = 0.5
 
-# bot2 s-tap timing (mirror Environment.java)
+# scripted s-tap opponent (eval yardstick only)
 S_TAP_MEAN = 3.0
-S_TAP_STD = 0.75
+S_TAP_STDDEV = 0.75
 S_TAP_MAX = 5
 
 MAX_HEALTH = 20.0
 
-# --- Action space (discrete; small turn deltas compose to any yaw/pitch) ---
+# --- reward weights ---
+DMG_TAKEN_W = 0.5        # net-damage tilt (dealt counts full, taken half -> rewards aggression)
+DIST_SHAPE_W = 0.02      # reward closing distance
+AIM_SHAPE_W = 0.10       # reward reducing aim error (drives 360 + pitch aiming)
+MISS_PENALTY = 0.10      # swung but couldn't connect
+TIME_PENALTY = 0.005     # small per-tick cost -> discourages the "both run away" stalemate
+TERMINAL = 20.0
+
+# --- Action space (15 discrete; LOOK_AT_TARGET snaps exact aim) ---
 (IDLE, FORWARD, SPRINT_FORWARD, BACK, STRAFE_LEFT, STRAFE_RIGHT,
- ATTACK, JUMP, YAW_L, YAW_R, YAW_L_FINE, YAW_R_FINE, PITCH_UP, PITCH_DOWN) = range(14)
-NUM_ACTIONS = 14
+ ATTACK, JUMP, YAW_L, YAW_R, YAW_L_FINE, YAW_R_FINE, PITCH_UP, PITCH_DOWN, LOOK_AT_TARGET) = range(15)
+NUM_ACTIONS = 15
 YAW_STEP = 15.0
 YAW_STEP_FINE = 4.0
 PITCH_STEP = 8.0
@@ -61,7 +72,6 @@ def _wrap_deg(a):
 
 
 def _look_vec(yaw_deg, pitch_deg):
-    """Unit look vector; xz forward = (cos yaw, sin yaw), matching the Java RayTrace."""
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
     cp = math.cos(pitch)
@@ -69,16 +79,14 @@ def _look_vec(yaw_deg, pitch_deg):
 
 
 def _ray_hits(att, dfn, reach=REACH):
-    """Slab-method port of RayTrace.canHit: does att's eye->look ray clip dfn's AABB?"""
     ex, ey, ez = att.x, att.y + EYE_HEIGHT, att.z
     lx, ly, lz = _look_vec(att.yaw, att.pitch)
-    dx, dy, dz = lx * reach, ly * reach, lz * reach
+    delta = (lx * reach, ly * reach, lz * reach)
     half = PLAYER_WIDTH / 2.0
     box = ((dfn.x - half, dfn.x + half),
            (dfn.y, dfn.y + PLAYER_HEIGHT),
            (dfn.z - half, dfn.z + half))
     origin = (ex, ey, ez)
-    delta = (dx, dy, dz)
     tmin, tmax = 0.0, 1.0
     for o, d, (lo, hi) in zip(origin, delta, box):
         if abs(d) < 1e-8:
@@ -119,78 +127,116 @@ class DuelEnv:
         self.bot2 = Bot()
         self.reset()
 
-    # ------------------------------------------------------------------ core
     def reset(self):
         self.bot1.reset(0.0, 0.0, 0.0)
         self.bot2.reset(10.0, 0.0, 180.0)
         self.steps = 0
         self._stap_ticks = 0
-        self._prev_dist, self._prev_aim = self._dist(), self._aim_error()
-        return self._observe()
+        self._prev_dist = self._dist()
+        self._prev_aim1 = self._aim_error(self.bot1, self.bot2)
+        self._prev_aim2 = self._aim_error(self.bot2, self.bot1)
+        return self._observe(self.bot1, self.bot2), self._observe(self.bot2, self.bot1)
 
-    def step(self, action):
-        self.bot1.was_hit = False
-        self.bot2.was_hit = False
-        hp2_before = self.bot2.health
-        hp1_before = self.bot1.health
+    # ----------------------------------------------------- self-play step
+    def step(self, a1, a2):
+        self.bot1.was_hit = self.bot2.was_hit = False
+        hp1, hp2 = self.bot1.health, self.bot2.health
+        ch1 = self.bot1.charge > FULL_STRENGTH and _ray_hits(self.bot1, self.bot2)
+        ch2 = self.bot2.charge > FULL_STRENGTH and _ray_hits(self.bot2, self.bot1)
 
-        could_hit = self.bot1.charge > FULL_STRENGTH and _ray_hits(self.bot1, self.bot2)
-        self._apply_action(self.bot1, action)
-        self._opponent_ai()
-
+        self._apply_action(self.bot1, self.bot2, a1)
+        self._apply_action(self.bot2, self.bot1, a2)
         self._physics(self.bot1)
         self._physics(self.bot2)
         self._recharge(self.bot1)
         self._recharge(self.bot2)
-
         self.steps += 1
-        dmg_dealt = max(0.0, hp2_before - self.bot2.health)
-        dmg_taken = max(0.0, hp1_before - self.bot1.health)
-        reward = self._reward(action, dmg_dealt, dmg_taken, could_hit)
+
+        d2 = max(0.0, hp2 - self.bot2.health)   # bot1 dealt this
+        d1 = max(0.0, hp1 - self.bot1.health)   # bot2 dealt this
         done = self.bot1.health <= 0 or self.bot2.health <= 0 or self.steps >= self.max_steps
-        return self._observe(), reward, done, {"dmg_dealt": dmg_dealt, "dmg_taken": dmg_taken}
+
+        dist = self._dist()
+        aim1 = self._aim_error(self.bot1, self.bot2)
+        aim2 = self._aim_error(self.bot2, self.bot1)
+        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, self._prev_dist, self._prev_aim1, dist, aim1)
+        r2 = self._reward(self.bot2, self.bot1, a2, d1, d2, ch2, self._prev_dist, self._prev_aim2, dist, aim2)
+        self._prev_dist, self._prev_aim1, self._prev_aim2 = dist, aim1, aim2
+
+        info = {"dmg_dealt": d2, "dmg_taken": d1}
+        return self._observe(self.bot1, self.bot2), self._observe(self.bot2, self.bot1), r1, r2, done, info
+
+    # ------------------------------------------- eval step (vs scripted s-tap)
+    def step_eval(self, a1):
+        self.bot1.was_hit = self.bot2.was_hit = False
+        hp1, hp2 = self.bot1.health, self.bot2.health
+        ch1 = self.bot1.charge > FULL_STRENGTH and _ray_hits(self.bot1, self.bot2)
+
+        self._apply_action(self.bot1, self.bot2, a1)
+        self._opponent_ai()
+        self._physics(self.bot1)
+        self._physics(self.bot2)
+        self._recharge(self.bot1)
+        self._recharge(self.bot2)
+        self.steps += 1
+
+        d2 = max(0.0, hp2 - self.bot2.health)
+        d1 = max(0.0, hp1 - self.bot1.health)
+        done = self.bot1.health <= 0 or self.bot2.health <= 0 or self.steps >= self.max_steps
+
+        dist = self._dist()
+        aim1 = self._aim_error(self.bot1, self.bot2)
+        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, self._prev_dist, self._prev_aim1, dist, aim1)
+        self._prev_dist, self._prev_aim1 = dist, aim1
+
+        info = {"dmg_dealt": d2, "dmg_taken": d1}
+        return self._observe(self.bot1, self.bot2), r1, done, info
 
     # ------------------------------------------------------------- actions
-    def _apply_action(self, b, a):
-        yaw = math.radians(b.yaw)
+    def _apply_action(self, bot, opp, a):
+        yaw = math.radians(bot.yaw)
         if a == FORWARD:
-            b.vx += math.cos(yaw) * WALK_IMPULSE
-            b.vz += math.sin(yaw) * WALK_IMPULSE
+            bot.vx += math.cos(yaw) * WALK_IMPULSE
+            bot.vz += math.sin(yaw) * WALK_IMPULSE
         elif a == SPRINT_FORWARD:
-            b.sprinting = True
-            b.vx += math.cos(yaw) * WALK_IMPULSE * SPRINT_MULTIPLIER
-            b.vz += math.sin(yaw) * WALK_IMPULSE * SPRINT_MULTIPLIER
+            bot.sprinting = True
+            bot.vx += math.cos(yaw) * WALK_IMPULSE * SPRINT_MULTIPLIER
+            bot.vz += math.sin(yaw) * WALK_IMPULSE * SPRINT_MULTIPLIER
         elif a == BACK:
-            b.sprinting = False
-            b.vx -= math.cos(yaw) * WALK_IMPULSE
-            b.vz -= math.sin(yaw) * WALK_IMPULSE
+            bot.sprinting = False
+            bot.vx -= math.cos(yaw) * WALK_IMPULSE
+            bot.vz -= math.sin(yaw) * WALK_IMPULSE
         elif a == STRAFE_LEFT:
-            b.sprinting = False
-            b.vx += math.cos(yaw - math.pi / 2) * WALK_IMPULSE
-            b.vz += math.sin(yaw - math.pi / 2) * WALK_IMPULSE
+            bot.sprinting = False
+            bot.vx += math.cos(yaw - math.pi / 2) * WALK_IMPULSE
+            bot.vz += math.sin(yaw - math.pi / 2) * WALK_IMPULSE
         elif a == STRAFE_RIGHT:
-            b.sprinting = False
-            b.vx += math.cos(yaw + math.pi / 2) * WALK_IMPULSE
-            b.vz += math.sin(yaw + math.pi / 2) * WALK_IMPULSE
+            bot.sprinting = False
+            bot.vx += math.cos(yaw + math.pi / 2) * WALK_IMPULSE
+            bot.vz += math.sin(yaw + math.pi / 2) * WALK_IMPULSE
         elif a == ATTACK:
-            self._perform_attack(self.bot1, self.bot2)
+            self._perform_attack(bot, opp)
         elif a == JUMP:
-            if b.on_ground:
-                b.vy = JUMP_VELOCITY
-                b.on_ground = False
+            if bot.on_ground:
+                bot.vy = JUMP_VELOCITY
+                bot.on_ground = False
         elif a == YAW_L:
-            b.yaw = _wrap_deg(b.yaw - YAW_STEP)
+            bot.yaw = _wrap_deg(bot.yaw - YAW_STEP)
         elif a == YAW_R:
-            b.yaw = _wrap_deg(b.yaw + YAW_STEP)
+            bot.yaw = _wrap_deg(bot.yaw + YAW_STEP)
         elif a == YAW_L_FINE:
-            b.yaw = _wrap_deg(b.yaw - YAW_STEP_FINE)
+            bot.yaw = _wrap_deg(bot.yaw - YAW_STEP_FINE)
         elif a == YAW_R_FINE:
-            b.yaw = _wrap_deg(b.yaw + YAW_STEP_FINE)
+            bot.yaw = _wrap_deg(bot.yaw + YAW_STEP_FINE)
         elif a == PITCH_UP:
-            b.pitch = max(-90.0, b.pitch - PITCH_STEP)
+            bot.pitch = max(-90.0, bot.pitch - PITCH_STEP)
         elif a == PITCH_DOWN:
-            b.pitch = min(90.0, b.pitch + PITCH_STEP)
-        # IDLE: nothing — friction/gravity still apply in _physics
+            bot.pitch = min(90.0, bot.pitch + PITCH_STEP)
+        elif a == LOOK_AT_TARGET:
+            dx, dz, dy = opp.x - bot.x, opp.z - bot.z, opp.y - bot.y
+            bot.yaw = math.degrees(math.atan2(dz, dx))
+            bot.pitch = -math.degrees(math.atan2(dy, math.hypot(dx, dz)))
+        # IDLE: nothing
 
     # ----------------------------------------------------------- combat
     def _perform_attack(self, att, dfn):
@@ -200,15 +246,14 @@ class DuelEnv:
             return
         scale = max(0.0, min(1.0, att.charge))
         dmg = ATTACK_DAMAGE * (0.2 + 0.8 * scale * scale)
-        crit = (not att.on_ground) and att.vy < 0.0 and not att.sprinting
-        if crit:
+        if (not att.on_ground) and att.vy < 0.0 and not att.sprinting:
             dmg *= 1.5
         taken = dmg * PROTECTION_MULT
         if taken > 0.0:
             dfn.health -= taken
             self._knockback(att, dfn)
         att.charge = 0.0
-        att.sprinting = False   # sprint-reset / w-tap on a landed hit
+        att.sprinting = False
 
     def _knockback(self, att, dfn):
         dx, dz = dfn.x - att.x, dfn.z - att.z
@@ -225,7 +270,7 @@ class DuelEnv:
     def _recharge(self, b):
         b.charge = min(1.0, b.charge + CHARGE_PER_TICK)
 
-    # ---------------------------------------------------- scripted bot2
+    # ----------------------------------------------- scripted opponent (eval)
     def _opponent_ai(self):
         b1, b2 = self.bot1, self.bot2
         dx, dy, dz = b1.x - b2.x, b1.y - b2.y, b1.z - b2.z
@@ -245,7 +290,7 @@ class DuelEnv:
         before = b2.charge
         self._perform_attack(b2, b1)
         if b2.charge < before:
-            sampled = S_TAP_MEAN + self.rng.normal() * S_TAP_STD
+            sampled = S_TAP_MEAN + self.rng.normal() * S_TAP_STDDEV
             self._stap_ticks = int(round(max(1.0, min(float(S_TAP_MAX), sampled))))
 
     # ------------------------------------------------------- physics
@@ -267,64 +312,46 @@ class DuelEnv:
     def _dist(self):
         return math.hypot(self.bot2.x - self.bot1.x, self.bot2.z - self.bot1.z)
 
-    def _aim_error(self):
-        """Angle (radians) between bot1's look vector and the direction to bot2's eye."""
-        b1, b2 = self.bot1, self.bot2
-        tx, ty, tz = b2.x - b1.x, (b2.y + EYE_HEIGHT) - (b1.y + EYE_HEIGHT), b2.z - b1.z
+    def _aim_error(self, me, opp):
+        tx, ty, tz = opp.x - me.x, opp.y - me.y, opp.z - me.z   # eye heights cancel
         tl = math.sqrt(tx * tx + ty * ty + tz * tz) or 1e-6
-        lx, ly, lz = _look_vec(b1.yaw, b1.pitch)
+        lx, ly, lz = _look_vec(me.yaw, me.pitch)
         dot = (tx * lx + ty * ly + tz * lz) / tl
         return math.acos(max(-1.0, min(1.0, dot)))
 
-    def _observe(self):
-        b1, b2 = self.bot1, self.bot2
-        dx, dz = b2.x - b1.x, b2.z - b1.z
-        dy = b2.y - b1.y
+    def _observe(self, me, opp):
+        dx, dz, dy = opp.x - me.x, opp.z - me.z, opp.y - me.y
         dist = math.hypot(dx, dz)
-        # relative yaw to target
         bearing = math.degrees(math.atan2(dz, dx))
-        rel_yaw = math.radians(_wrap_deg(bearing - b1.yaw))
-        # relative pitch error (desired pitch onto target eye vs current pitch)
-        desired_pitch = -math.degrees(math.atan2((b2.y + EYE_HEIGHT) - (b1.y + EYE_HEIGHT), max(dist, 1e-6)))
-        rel_pitch = math.radians(_wrap_deg(desired_pitch - b1.pitch))
-        # Facing-relative velocity (forward / strafe components) so it transfers cleanly to the
-        # mod regardless of the sim-vs-MC yaw convention.
-        syaw = math.radians(b1.yaw)
-        fwd_v = b1.vx * math.cos(syaw) + b1.vz * math.sin(syaw)
-        strafe_v = -b1.vx * math.sin(syaw) + b1.vz * math.cos(syaw)
-        obs = np.array([
+        rel_yaw = math.radians(_wrap_deg(bearing - me.yaw))
+        desired_pitch = -math.degrees(math.atan2(dy, max(dist, 1e-6)))
+        rel_pitch = math.radians(_wrap_deg(desired_pitch - me.pitch))
+        syaw = math.radians(me.yaw)
+        fwd_v = me.vx * math.cos(syaw) + me.vz * math.sin(syaw)
+        strafe_v = -me.vx * math.sin(syaw) + me.vz * math.cos(syaw)
+        return np.array([
             min(dist / 10.0, 2.0),
             dy,
             math.sin(rel_yaw), math.cos(rel_yaw),
             math.sin(rel_pitch), math.cos(rel_pitch),
             fwd_v, strafe_v,
-            b1.charge,
-            b1.health / MAX_HEALTH,
-            b2.health / MAX_HEALTH,
-            1.0 if b1.on_ground else 0.0,
-            1.0 if _ray_hits(b1, b2) else 0.0,
+            me.charge,
+            me.health / MAX_HEALTH,
+            opp.health / MAX_HEALTH,
+            1.0 if me.on_ground else 0.0,
+            1.0 if _ray_hits(me, opp) else 0.0,
         ], dtype=np.float32)
-        return obs
 
     # ------------------------------------------------------- reward
-    def _reward(self, action, dmg_dealt, dmg_taken, could_hit):
-        r = 0.0
-        r += dmg_dealt
-        r -= 0.75 * dmg_taken
-
-        dist = self._dist()
-        r += 0.02 * (self._prev_dist - dist)          # reward closing distance
-        self._prev_dist = dist
-
-        aim = self._aim_error()
-        r += 0.1 * (self._prev_aim - aim)             # reward reducing aim error (drives 360+pitch)
-        self._prev_aim = aim
-
+    def _reward(self, me, opp, action, dmg_dealt, dmg_taken, could_hit, prev_dist, prev_aim, dist, aim):
+        r = dmg_dealt - DMG_TAKEN_W * dmg_taken
+        r += DIST_SHAPE_W * (prev_dist - dist)
+        r += AIM_SHAPE_W * (prev_aim - aim)
         if action == ATTACK and not could_hit:
-            r -= 0.1                                   # punish swinging when it can't connect
-
-        if self.bot2.health <= 0:
-            r += 20.0
-        if self.bot1.health <= 0:
-            r -= 20.0
+            r -= MISS_PENALTY
+        r -= TIME_PENALTY
+        if opp.health <= 0:
+            r += TERMINAL
+        if me.health <= 0:
+            r -= TERMINAL
         return r
