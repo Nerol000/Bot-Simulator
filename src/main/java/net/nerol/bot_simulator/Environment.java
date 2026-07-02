@@ -7,7 +7,6 @@ import net.nerol.bot_simulator.minecraft.world.item.ItemType;
 import net.nerol.bot_simulator.minecraft.world.item.enchantments.Enchantment;
 import net.nerol.bot_simulator.minecraft.world.item.enchantments.EnchantmentType;
 import net.nerol.bot_simulator.minecraft.world.phys.PhysicsEngine;
-import net.nerol.bot_simulator.minecraft.world.phys.RayTrace;
 
 import java.util.Random;
 
@@ -44,35 +43,31 @@ public class Environment {
 
         switch (action) {
             case SPRINT:
-                bot1.sprinting = !bot1.sprinting;
-                if (bot1.sprinting) {
-                    bot1.sneaking = false;
-                    bot1.walking_back = false;
+                if (!bot1.walking_back) {
+                    bot1.sprinting = !bot1.sprinting;
                 }
                 break;
             case MOVE_FORWARD:
-                bot1.walking_forward = !bot1.walking_forward;
-                bot1.sprinting = false;
-                if (bot1.walking_forward) {
-                    bot1.walking_back = false;
+                if (!bot1.sprinting) {
+                    bot1.walking_forward = !bot1.walking_forward;
                 }
                 break;
             case MOVE_BACK:
-                bot1.walking_back = !bot1.walking_back;
-                if (bot1.walking_back) {
-                    bot1.walking_forward = false;
-                    bot1.sprinting = false;
+                if (!bot1.walking_forward && !bot1.sprinting) {
+                    bot1.walking_back = !bot1.walking_back;
                 }
                 break;
 
             case STRAFE_LEFT:
-                bot1.strafing_left = !bot1.strafing_left;
-                if (bot1.strafing_left) bot1.strafing_right = false;
+                if (!bot1.strafing_right) {
+                    bot1.strafing_left = !bot1.strafing_left;
+                }
                 break;
 
             case STRAFE_RIGHT:
-                bot1.strafing_right = !bot1.strafing_right;
-                if (bot1.strafing_right) bot1.strafing_left = false;
+                if (!bot1.strafing_left) {
+                    bot1.strafing_right = !bot1.strafing_right;
+                }
                 break;
 
             case ATTACK:
@@ -98,9 +93,6 @@ public class Environment {
             case JUMP:
                 jump();
                 break;
-
-            case LOOK_AT:
-                lookAt(bot1, bot2);
         }
 
         if (bot1.sprinting) setSprinting();
@@ -148,7 +140,7 @@ public class Environment {
     }
 
     void attack() {
-        if (Math.max(0.0, Math.min(1.0, bot1.attackCharge)) > 0.9) performAttack(bot1, bot2);
+        performAttack(bot1, bot2);
     }
 
     /** Faithful port of the mod's {@code PvPBot.attack(Entity)}: attack-strength scaling,
@@ -160,21 +152,15 @@ public class Environment {
         // attackStrengthScale = getAttackStrengthScale(0.5F): cooldown charge in [0,1].
         double scale = Math.max(0.0, Math.min(1.0, attacker.attackCharge));
 
-        boolean fullStrengthAttack = scale >= 1.0;
-
-        // Entity-pick raycast (mirrors ActionPack.leftClick): the swing only lands if a ray
-        // from the attacker's eye along its look direction clips the defender's hitbox within
-        // reach.
-        if (!RayTrace.canHit(attacker, defender)) {
-            attacker.attackCharge = 0.0;
-            return;
+        boolean fullStrengthAttack = scale > 0.9;
+        if (!fullStrengthAttack) {
+            return; // leftClick drops a non-full swing before it even swings.
         }
 
-        // Out of melee reach (3 blocks): a swing at air
+        // Out of melee reach (3 blocks): a swing at air — no damage, cooldown not consumed.
         double ddx = defender.Pos.x - attacker.Pos.x;
         double ddz = defender.Pos.z - attacker.Pos.z;
         if (ddx * ddx + ddz * ddz > 9.0) {
-            attacker.attackCharge = 0.0;
             return;
         }
 
@@ -237,11 +223,11 @@ public class Environment {
 
     void lookAt(PvPBot self, PvPBot target) {
         double dx = target.Pos.x - self.Pos.x;
-        double dy = target.Pos.y - self.Pos.y;
         double dz = target.Pos.z - self.Pos.z;
 
-        self.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
-        self.Rotation.y = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        double angle = Math.toDegrees(Math.atan2(dz, dx));
+
+        self.Rotation.x = (float)angle;
     }
 
     void stopMovement() {
@@ -270,10 +256,8 @@ public class Environment {
 
         // Face bot1 every tick.
         double dx = bot1.Pos.x - bot2.Pos.x;
-        double dy = bot1.Pos.y - bot2.Pos.y;
         double dz = bot1.Pos.z - bot2.Pos.z;
         bot2.Rotation.x = (float) Math.toDegrees(Math.atan2(dz, dx));
-        bot2.Rotation.y = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
         double yaw = Math.toRadians(bot2.getYaw());
 
         double walkImpulse = bot2.attributes.get(AttributeType.MOVEMENT_SPEED) * WALK_IMPULSE_PER_SPEED;
@@ -299,14 +283,12 @@ public class Environment {
         // Swing with the faithful combat rules (reach + full-strength gating, knockback).
         // performAttack consumes the charge only on a real in-reach hit, so a drop in the
         // charge tells us a hit just landed — that kicks off the next s-tap.
-        if (RayTrace.canHit(bot2, bot1, 0.0)) {
-            double chargeBeforeSwing = bot2.attackCharge;
-            performAttack(bot2, bot1);
-            if (bot2.attackCharge < chargeBeforeSwing) {
-                // Jittered s-tap length: round a Gaussian draw and clamp to [0, S_TAP_MAX].
-                double sampled = S_TAP_MEAN + random.nextGaussian() * S_TAP_STDDEV;
-                bot2StapTicks = (int) Math.round(Math.max(1.0, Math.min(S_TAP_MAX, sampled)));
-            }
+        double chargeBeforeSwing = bot2.attackCharge;
+        performAttack(bot2, bot1);
+        if (bot2.attackCharge < chargeBeforeSwing) {
+            // Jittered s-tap length: round a Gaussian draw and clamp to [0, S_TAP_MAX].
+            double sampled = S_TAP_MEAN + random.nextGaussian() * S_TAP_STDDEV;
+            bot2StapTicks = (int) Math.round(Math.max(1.0, Math.min(S_TAP_MAX, sampled)));
         }
     }
 
@@ -326,12 +308,11 @@ public class Environment {
         // Distance from bot1 to bot2, not from world origin. Same convention the MC
         // LiveController will use, so the Q-table transfers cleanly.
         double dx = bot2.Pos.x - bot1.Pos.x;
-        double dy = bot2.Pos.y - bot1.Pos.y;
         double dz = bot2.Pos.z - bot1.Pos.z;
-        double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        double dist = Math.sqrt(dx * dx + dz * dz);
 
-        if (dist < 2.0) return 0;
-        if (dist <= 3.0) return 1;
+        if (dist < 1.66666) return 0;
+        if (dist <= 3) return 1;
         return 2;
     }
     int computeDirectionBucket() {
@@ -346,10 +327,9 @@ public class Environment {
     }
     double distanceSquaredTobot2() {
         double dx = bot2.Pos.x - bot1.Pos.x;
-        double dy = bot2.Pos.y - bot1.Pos.y;
         double dz = bot2.Pos.z - bot1.Pos.z;
 
-        return dx * dx + dy * dy + dz * dz;
+        return dx * dx + dz * dz;
     }
     public void reset() {
         // player
