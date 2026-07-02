@@ -43,6 +43,7 @@ public class PvPBot {
     public boolean strafing_left = false;
     public boolean strafing_right = false;
     public boolean walking_back = false;
+    public boolean sneaking = false;
 
 
     public float getYaw() {

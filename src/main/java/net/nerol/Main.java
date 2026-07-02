@@ -1,17 +1,23 @@
 package net.nerol;
 
 import net.nerol.bot_simulator.*;
+import net.nerol.bot_simulator.minecraft.world.phys.RayTrace;
+
 import java.io.FileWriter;
 import java.io.PrintWriter;
 
-//TIP To <b>Run</b> code, press <shortcut actionId="Run"/> or
-// click the <icon src="AllIcons.Actions.Execute"/> icon in the gutter.
 public class Main {
     private static Action prevAction;
 
-    public static void main(String[] args) {
+    private static final String CHECKPOINT_PATH = "qtable.csv";
 
+    public static void main(String[] args) {
         QTable qTable = new QTable();
+
+        if (new java.io.File(CHECKPOINT_PATH).exists()) {
+            qTable.load(CHECKPOINT_PATH);
+            System.out.println("Resumed Q-table from " + CHECKPOINT_PATH);
+        }
         Agent agent = new Agent(qTable);
         Environment env = new Environment();
 
@@ -32,13 +38,15 @@ public class Main {
                 double totalReward = 0;
                 State state = env.getCurrentState();
 
-                for (int step = 0; step < 1200; step++) { // 60 sec duel
+                for (int step = 0; step < 1800; step++) { // 120 sec duel
 
                     Action action = agent.chooseAction(state);
 
                     // Snapshot HP before the tick so we can derive per-tick damage deltas.
                     float bot2HealthBefore = env.bot2.Health;
                     float bot1HealthBefore = env.bot1.Health;
+
+                    boolean attackMissed = action == Action.ATTACK && !RayTrace.canHit(env.bot1, env.bot2);
 
                     env.executeAction(action);
 
@@ -47,7 +55,7 @@ public class Main {
                     double damageDealt = Math.max(0.0, bot2HealthBefore - env.bot2.Health);
                     double damageTaken = Math.max(0.0, bot1HealthBefore - env.bot1.Health);
 
-                    double reward = computeReward(state, action, nextState, prevAction, env, damageDealt, damageTaken);
+                    double reward = computeReward(state, action, nextState, prevAction, env, damageDealt, damageTaken, attackMissed);
 
                     agent.learn(state, action, reward, nextState);
 
@@ -81,66 +89,59 @@ public class Main {
 
                     if (env.isEpisodeOver()) break;
                 }
-                if (episode % 100 == 0) System.out.println("Episode " + episode + " total reward = " + totalReward);
+                if (episode % 10000 == 0) System.out.println("Episode " + episode + " total reward = " + totalReward);
+
+                if (episode % checkpointInterval(episode) == 0) qTable.save(CHECKPOINT_PATH);
             }
             //writer.close();
         } catch (Exception e) {
             e.printStackTrace();
         }
 
-        // Persist the trained Q-table for the mod to load. The replay CSV above is
-        // kept too — it's useful for debugging individual transitions even after the
-        // policy ships.
-        qTable.save("qtable.csv");
+        qTable.save(CHECKPOINT_PATH);
     }
 
-    static double computeReward(State s, Action a, State s2, Action prevAction, Environment env,
-                                double damageDealt, double damageTaken) {
-
+    static double computeReward(State s, Action a, State s2, Action prevAction, Environment env, double damageDealt, double damageTaken, boolean attackMissed) {
         double reward = 0.0;
 
-        // 1. Reward getting closer to FRONT
-//        if (isCloserToFront(s.direction, s2.direction)) {
-//            reward += 0.02;
-//        }
+        if (a.name().startsWith("TURN")) {
+            if (s2.direction == 0) {
+                reward += 0.0025;
+            } else if (isCloserToFront(s.direction, s2.direction)) {
+                reward += 0.0015;
+            }
+        }
 
-        // 2. Reward getting closer in distance
+        // Reward getting closer in distance
         if (s2.distance < s.distance) {
-            reward += 0.05;
+            reward += 0.01;
         }
 
-        // 3. Penalty for bad attack — wasted swing in the wrong context
-        if (a == Action.ATTACK &&
-                !(s.distance == 0 && isFacingFront(s.direction))) {
-            reward -= 0.1;
+        if (attackMissed) {
+            reward -= 0.003;
         }
 
-        // 4. Discourage spam jump
+        // Discourage spam jump
         //if (a == Action.JUMP) {
         //    reward -= 0.02;
         //}
 
-        // 5. Small penalty for turning (encourage efficiency)
+        // Small penalty for turning (encourage efficiency)
         if (a.name().startsWith("TURN")) {
-            reward -= 0.01;
+            reward -= 0.001;
         }
 
-        // 6. Reward damage dealt to opponent (1 reward per HP). Naturally scales with
-        //    crits (1.5x), Sharpness, and Protection on the target — those all move
-        //    the underlying damage number, which propagates here.
-        reward += damageDealt;
+        reward += damageDealt * 2;
+        reward -= damageTaken;
 
-        // 7. Punish damage taken (1 penalty per HP).
-        reward -= damageTaken * 0.75;
-
-        // 8. Terminal: killed opponent
+        // killed opponent
         if (env.bot2.Health <= 0) {
-            reward += 20.0;
+            reward += 30.0;
         }
 
-        // 9. Terminal: died
+        // died
         if (env.bot1.Health <= 0) {
-            reward -= 20.0;
+            reward -= 25.0;
         }
 
         return reward;
@@ -157,5 +158,11 @@ public class Main {
 
     static boolean isCloserToFront(int d1, int d2) {
         return distanceToFront(d2) < distanceToFront(d1);
+    }
+
+    static int checkpointInterval(int episode) {
+        if (episode < 10_000)  return 100;
+        if (episode < 100_000) return 1_000;
+        return 10_000;
     }
 }
