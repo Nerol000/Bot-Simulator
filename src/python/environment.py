@@ -53,7 +53,7 @@ DMG_TAKEN_W = 0.5        # net-damage tilt (dealt counts full, taken half -> rew
 DIST_SHAPE_W = 0.02      # reward closing distance
 AIM_SHAPE_W = 0.10       # reward reducing aim error (drives 360 + pitch aiming)
 MISS_PENALTY = 0.10      # swung while CHARGED but mis-aimed (wasted a ready swing)
-#GOOD_SWING_W = 0.30      # charged + on-target swing -> reinforces attacking when it can land
+GOOD_SWING_W = 0.30      # charged + on-target swing -> reinforces attacking when it can land
 TIME_PENALTY = 0.005     # small per-tick cost -> discourages the "both run away" stalemate
 TERMINAL = 20.0
 
@@ -142,8 +142,10 @@ class DuelEnv:
     def step(self, a1, a2):
         self.bot1.was_hit = self.bot2.was_hit = False
         hp1, hp2 = self.bot1.health, self.bot2.health
-        ch1 = self.bot1.charge > FULL_STRENGTH and _ray_hits(self.bot1, self.bot2)
-        ch2 = self.bot2.charge > FULL_STRENGTH and _ray_hits(self.bot2, self.bot1)
+        rdy1 = self.bot1.charge > FULL_STRENGTH
+        rdy2 = self.bot2.charge > FULL_STRENGTH
+        ch1 = rdy1 and _ray_hits(self.bot1, self.bot2)
+        ch2 = rdy2 and _ray_hits(self.bot2, self.bot1)
 
         self._apply_action(self.bot1, self.bot2, a1)
         self._apply_action(self.bot2, self.bot1, a2)
@@ -160,8 +162,8 @@ class DuelEnv:
         dist = self._dist()
         aim1 = self._aim_error(self.bot1, self.bot2)
         aim2 = self._aim_error(self.bot2, self.bot1)
-        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, self._prev_dist, self._prev_aim1, dist, aim1)
-        r2 = self._reward(self.bot2, self.bot1, a2, d1, d2, ch2, self._prev_dist, self._prev_aim2, dist, aim2)
+        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, rdy1, self._prev_dist, self._prev_aim1, dist, aim1)
+        r2 = self._reward(self.bot2, self.bot1, a2, d1, d2, ch2, rdy2, self._prev_dist, self._prev_aim2, dist, aim2)
         self._prev_dist, self._prev_aim1, self._prev_aim2 = dist, aim1, aim2
 
         info = {"dmg_dealt": d2, "dmg_taken": d1}
@@ -171,7 +173,8 @@ class DuelEnv:
     def step_eval(self, a1):
         self.bot1.was_hit = self.bot2.was_hit = False
         hp1, hp2 = self.bot1.health, self.bot2.health
-        ch1 = self.bot1.charge > FULL_STRENGTH and _ray_hits(self.bot1, self.bot2)
+        rdy1 = self.bot1.charge > FULL_STRENGTH
+        ch1 = rdy1 and _ray_hits(self.bot1, self.bot2)
 
         self._apply_action(self.bot1, self.bot2, a1)
         self._opponent_ai()
@@ -187,7 +190,7 @@ class DuelEnv:
 
         dist = self._dist()
         aim1 = self._aim_error(self.bot1, self.bot2)
-        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, self._prev_dist, self._prev_aim1, dist, aim1)
+        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, rdy1, self._prev_dist, self._prev_aim1, dist, aim1)
         self._prev_dist, self._prev_aim1 = dist, aim1
 
         info = {"dmg_dealt": d2, "dmg_taken": d1}
@@ -343,12 +346,16 @@ class DuelEnv:
         ], dtype=np.float32)
 
     # ------------------------------------------------------- reward
-    def _reward(self, me, opp, action, dmg_dealt, dmg_taken, could_hit, prev_dist, prev_aim, dist, aim):
+    def _reward(self, me, opp, action, dmg_dealt, dmg_taken, could_hit, was_ready, prev_dist, prev_aim, dist, aim):
         r = dmg_dealt - DMG_TAKEN_W * dmg_taken
         r += DIST_SHAPE_W * (prev_dist - dist)
         r += AIM_SHAPE_W * (prev_aim - aim)
-        if action == ATTACK and not could_hit:
-            r -= MISS_PENALTY
+        if action == ATTACK:
+            if could_hit:
+                r += GOOD_SWING_W          # charged + on target -> land the hit
+            elif was_ready:
+                r -= MISS_PENALTY          # charged but mis-aimed -> wasted swing
+            # swinging on cooldown is harmless in MC: no penalty
         r -= TIME_PENALTY
         if opp.health <= 0:
             r += TERMINAL
