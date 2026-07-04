@@ -195,6 +195,59 @@ class DuelEnv:
 
         info = {"dmg_dealt": d2, "dmg_taken": d1}
         return self._observe(self.bot1, self.bot2), r1, done, info
+
+    # ------------------------------------------- step vs a pluggable opponent
+    def step_against(self, a1, opponent):
+        """Advance one tick with bot1 driven by action index `a1` and bot2 driven by a
+        pluggable `opponent` (an Opponent that returns an action index for bot2). Mirrors
+        step_eval()'s single-learner return shape so tabular/neural learners share a loop.
+        Used by the H1/H2 experiments (Win-Max / TD-Error / Champion / Teacher FSMs)."""
+        self.bot1.was_hit = self.bot2.was_hit = False
+        hp1, hp2 = self.bot1.health, self.bot2.health
+        rdy1 = self.bot1.charge > FULL_STRENGTH
+        ch1 = rdy1 and _ray_hits(self.bot1, self.bot2)
+
+        a2 = opponent.act(self, self.bot2, self.bot1)
+        self._apply_action(self.bot1, self.bot2, a1)
+        self._apply_action(self.bot2, self.bot1, a2)
+        self._physics(self.bot1)
+        self._physics(self.bot2)
+        self._recharge(self.bot1)
+        self._recharge(self.bot2)
+        self.steps += 1
+
+        d2 = max(0.0, hp2 - self.bot2.health)
+        d1 = max(0.0, hp1 - self.bot1.health)
+        done = self.bot1.health <= 0 or self.bot2.health <= 0 or self.steps >= self.max_steps
+
+        dist = self._dist()
+        aim1 = self._aim_error(self.bot1, self.bot2)
+        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, rdy1, self._prev_dist, self._prev_aim1, dist, aim1)
+        self._prev_dist, self._prev_aim1 = dist, aim1
+
+        info = {"dmg_dealt": d2, "dmg_taken": d1, "opp_action": a2}
+        return self._observe(self.bot1, self.bot2), r1, done, info
+
+    # ------------------------------------------- discrete state (tabular port)
+    def state_index(self, me, opp):
+        """Java-faithful discrete state: distance bucket (3) x direction bucket (8) -> 0..23.
+        Mirrors Environment.java computeDistanceBucket()/computeDirectionBucket()."""
+        dx = opp.x - me.x
+        dz = opp.z - me.z
+        dist = math.hypot(dx, dz)
+        if dist < 1.66666:
+            dbucket = 0
+        elif dist <= 3.0:
+            dbucket = 1
+        else:
+            dbucket = 2
+        bearing = math.degrees(math.atan2(dz, dx))
+        relative = ((bearing - me.yaw) % 360 + 360 + 22.5) % 360
+        dirbucket = int(relative / 45.0)  # 0..7
+        return dbucket * 8 + dirbucket
+
+    NUM_STATES = 24
+
     # ------------------------------------------------------------- actions
     def _apply_action(self, bot, opp, a):
         yaw = math.radians(bot.yaw)
