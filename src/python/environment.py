@@ -48,11 +48,12 @@ S_TAP_MAX = 5
 
 MAX_HEALTH = 20.0
 
-# --- reward weights ---
+#--- reward weights ---
 DMG_TAKEN_W = 0.5        # net-damage tilt (dealt counts full, taken half -> rewards aggression)
 DIST_SHAPE_W = 0.02      # reward closing distance
 AIM_SHAPE_W = 0.10       # reward reducing aim error (drives 360 + pitch aiming)
-MISS_PENALTY = 0.10      # swung but couldn't connect
+MISS_PENALTY = 0.10      # swung while CHARGED but mis-aimed (wasted a ready swing)
+#GOOD_SWING_W = 0.30      # charged + on-target swing -> reinforces attacking when it can land
 TIME_PENALTY = 0.005     # small per-tick cost -> discourages the "both run away" stalemate
 TERMINAL = 20.0
 
@@ -191,7 +192,6 @@ class DuelEnv:
 
         info = {"dmg_dealt": d2, "dmg_taken": d1}
         return self._observe(self.bot1, self.bot2), r1, done, info
-
     # ------------------------------------------------------------- actions
     def _apply_action(self, bot, opp, a):
         yaw = math.radians(bot.yaw)
