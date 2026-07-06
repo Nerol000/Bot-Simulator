@@ -121,8 +121,13 @@ class Bot:
 
 
 class DuelEnv:
-    def __init__(self, max_steps=1200, seed=0):
+    def __init__(self, max_steps=1200, seed=0, time_penalty=TIME_PENALTY):
         self.max_steps = max_steps
+        # Per-tick reward drain that discourages the "both bots run away forever" stalemate.
+        # Kept at TIME_PENALTY for the neural learner; the tabular trainer passes 0.0, because
+        # over ~1000 ticks the drain (~-5) sinks every learned Q-cell below the unvisited 0.0
+        # cells, inverting the greedy argmax. The Java tabular trainer has no such term.
+        self.time_penalty = time_penalty
         self.rng = np.random.default_rng(seed)
         self.bot1 = Bot()
         self.bot2 = Bot()
@@ -409,7 +414,7 @@ class DuelEnv:
             elif was_ready:
                 r -= MISS_PENALTY          # charged but mis-aimed -> wasted swing
             # swinging on cooldown is harmless in MC: no penalty
-        r -= TIME_PENALTY
+        r -= self.time_penalty
         if opp.health <= 0:
             r += TERMINAL
         if me.health <= 0:

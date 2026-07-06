@@ -64,7 +64,9 @@ def main():
     ap.add_argument("--eval-every", type=int, default=500)
     args = ap.parse_args()
 
-    env = DuelEnv(max_steps=args.max_steps, seed=args.seed)
+    # time_penalty=0.0: the 24x15 table can't out-run the per-tick drain (it sinks learned cells
+    # below unvisited 0.0 cells and inverts the greedy policy). Matches the Java tabular trainer.
+    env = DuelEnv(max_steps=args.max_steps, seed=args.seed, time_penalty=0.0)
     learner = TabularQLearner(env.NUM_STATES, NUM_ACTIONS, seed=args.seed)
 
     if args.eval:
