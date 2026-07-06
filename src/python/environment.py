@@ -57,6 +57,21 @@ GOOD_SWING_W = 0.30      # charged + on-target swing -> reinforces attacking whe
 TIME_PENALTY = 0.005     # small per-tick cost -> discourages the "both run away" stalemate
 TERMINAL = 20.0
 
+# --- discrete reward (tabular): mirrors RL/Simulator Main.computeReward, whose bucket-based
+# shaping matches the 24-state resolution. The continuous reward above is finer-grained than the
+# 24-state can perceive or act on, so tabular learners can't exploit it (they learn "don't
+# attack" because coarse-aim swings look like misses); this discrete variant keys reward off the
+# same distance/direction buckets the table indexes on. ---
+D_TURN_FRONT = 0.0025    # turned to face target dead-on (direction bucket 0)
+D_TURN_CLOSER = 0.0015   # turned nearer to front
+D_TURN_PENALTY = 0.001   # small cost per turn (efficiency)
+D_CLOSER = 0.01          # moved into a nearer distance bucket
+D_MISS = 0.003           # ATTACK that couldn't connect
+D_DMG_DEALT_W = 2.0
+D_DMG_TAKEN_W = 1.0
+D_KILL = 30.0
+D_DEATH = 25.0
+
 # --- Action space (15 discrete; LOOK_AT_TARGET snaps exact aim) ---
 (IDLE, FORWARD, SPRINT_FORWARD, BACK, STRAFE_LEFT, STRAFE_RIGHT,
  ATTACK, JUMP, YAW_L, YAW_R, YAW_L_FINE, YAW_R_FINE, PITCH_UP, PITCH_DOWN, LOOK_AT_TARGET) = range(15)
@@ -121,13 +136,20 @@ class Bot:
 
 
 class DuelEnv:
-    def __init__(self, max_steps=1200, seed=0, time_penalty=TIME_PENALTY):
+    def __init__(self, max_steps=1200, seed=0, time_penalty=TIME_PENALTY,
+                 reward_mode="continuous", miss_penalty=MISS_PENALTY):
         self.max_steps = max_steps
         # Per-tick reward drain that discourages the "both bots run away forever" stalemate.
         # Kept at TIME_PENALTY for the neural learner; the tabular trainer passes 0.0, because
         # over ~1000 ticks the drain (~-5) sinks every learned Q-cell below the unvisited 0.0
         # cells, inverting the greedy argmax. The Java tabular trainer has no such term.
         self.time_penalty = time_penalty
+        # Reward shaping used by the single-learner step_against(): "continuous" (the fine-grained
+        # default, for the neural learner) or "discrete" (Java-style bucket reward, for tabular).
+        self.reward_mode = reward_mode
+        # Penalty for a charged-but-mis-aimed swing (continuous reward only). Exposed so the
+        # tabular/coarse-state path can disable it (it over-punishes 45-degree-bucket aiming).
+        self.miss_penalty = miss_penalty
         self.rng = np.random.default_rng(seed)
         self.bot1 = Bot()
         self.bot2 = Bot()
@@ -141,6 +163,7 @@ class DuelEnv:
         self._prev_dist = self._dist()
         self._prev_aim1 = self._aim_error(self.bot1, self.bot2)
         self._prev_aim2 = self._aim_error(self.bot2, self.bot1)
+        self._prev_db1, self._prev_dir1 = self._state_buckets(self.bot1, self.bot2)
         return self._observe(self.bot1, self.bot2), self._observe(self.bot2, self.bot1)
 
     # ----------------------------------------------------- self-play step
@@ -227,15 +250,22 @@ class DuelEnv:
 
         dist = self._dist()
         aim1 = self._aim_error(self.bot1, self.bot2)
-        r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, rdy1, self._prev_dist, self._prev_aim1, dist, aim1)
+        db, dirb = self._state_buckets(self.bot1, self.bot2)
+        if self.reward_mode == "discrete":
+            r1 = self._reward_discrete(self.bot1, self.bot2, a1, d2, d1, ch1,
+                                       self._prev_db1, self._prev_dir1, db, dirb)
+        else:
+            r1 = self._reward(self.bot1, self.bot2, a1, d2, d1, ch1, rdy1,
+                              self._prev_dist, self._prev_aim1, dist, aim1)
         self._prev_dist, self._prev_aim1 = dist, aim1
+        self._prev_db1, self._prev_dir1 = db, dirb
 
         info = {"dmg_dealt": d2, "dmg_taken": d1, "opp_action": a2}
         return self._observe(self.bot1, self.bot2), r1, done, info
 
     # ------------------------------------------- discrete state (tabular port)
-    def state_index(self, me, opp):
-        """Java-faithful discrete state: distance bucket (3) x direction bucket (8) -> 0..23.
+    def _state_buckets(self, me, opp):
+        """(distance bucket 0..2, direction bucket 0..7) for the 24-state tabular index.
         Mirrors Environment.java computeDistanceBucket()/computeDirectionBucket()."""
         dx = opp.x - me.x
         dz = opp.z - me.z
@@ -249,6 +279,11 @@ class DuelEnv:
         bearing = math.degrees(math.atan2(dz, dx))
         relative = ((bearing - me.yaw) % 360 + 360 + 22.5) % 360
         dirbucket = int(relative / 45.0)  # 0..7
+        return dbucket, dirbucket
+
+    def state_index(self, me, opp):
+        """Java-faithful discrete state: distance bucket (3) x direction bucket (8) -> 0..23."""
+        dbucket, dirbucket = self._state_buckets(me, opp)
         return dbucket * 8 + dirbucket
 
     NUM_STATES = 24
@@ -412,11 +447,36 @@ class DuelEnv:
             if could_hit:
                 r += GOOD_SWING_W          # charged + on target -> land the hit
             elif was_ready:
-                r -= MISS_PENALTY          # charged but mis-aimed -> wasted swing
+                r -= self.miss_penalty     # charged but mis-aimed -> wasted swing
             # swinging on cooldown is harmless in MC: no penalty
         r -= self.time_penalty
         if opp.health <= 0:
             r += TERMINAL
         if me.health <= 0:
             r -= TERMINAL
+        return r
+
+    def _reward_discrete(self, me, opp, action, dmg_dealt, dmg_taken, could_hit,
+                         prev_db, prev_dir, db, dirb):
+        """Java-style bucket reward (RL/Simulator Main.computeReward). Keys off the same coarse
+        distance/direction buckets the 24-state table indexes on, so the tabular learner can
+        actually act on it (unlike the continuous reward, which needs sub-bucket precision)."""
+        r = 0.0
+        is_turn = action in (YAW_L, YAW_R, YAW_L_FINE, YAW_R_FINE)
+        if is_turn:
+            if dirb == 0:
+                r += D_TURN_FRONT
+            elif min(dirb, 8 - dirb) < min(prev_dir, 8 - prev_dir):
+                r += D_TURN_CLOSER
+            r -= D_TURN_PENALTY
+        if db < prev_db:
+            r += D_CLOSER                   # moved into a nearer distance bucket
+        if action == ATTACK and not could_hit:
+            r -= D_MISS
+        r += D_DMG_DEALT_W * dmg_dealt
+        r -= D_DMG_TAKEN_W * dmg_taken
+        if opp.health <= 0:
+            r += D_KILL
+        if me.health <= 0:
+            r -= D_DEATH
         return r

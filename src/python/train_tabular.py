@@ -62,11 +62,22 @@ def main():
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--eval-every", type=int, default=500)
+    # discrete (default) = Java-style bucket reward that matches the 24-state resolution, so the
+    # tabular bot can actually learn to attack. continuous = the fine-grained neural reward
+    # (kept for comparison / ablation; the coarse table struggles to exploit it).
+    ap.add_argument("--reward", choices=["discrete", "continuous"], default="discrete")
+    # only affects --reward continuous; disable to stop over-punishing coarse-bucket aiming.
+    ap.add_argument("--miss-penalty", type=float, default=None,
+                    help="override continuous-reward MISS_PENALTY (e.g. 0 to disable)")
     args = ap.parse_args()
 
     # time_penalty=0.0: the 24x15 table can't out-run the per-tick drain (it sinks learned cells
     # below unvisited 0.0 cells and inverts the greedy policy). Matches the Java tabular trainer.
-    env = DuelEnv(max_steps=args.max_steps, seed=args.seed, time_penalty=0.0)
+    env_kwargs = dict(max_steps=args.max_steps, seed=args.seed, time_penalty=0.0,
+                      reward_mode=args.reward)
+    if args.miss_penalty is not None:
+        env_kwargs["miss_penalty"] = args.miss_penalty
+    env = DuelEnv(**env_kwargs)
     learner = TabularQLearner(env.NUM_STATES, NUM_ACTIONS, seed=args.seed)
 
     if args.eval:
