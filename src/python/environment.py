@@ -122,7 +122,7 @@ def _ray_hits(att, dfn, reach=REACH):
 
 class Bot:
     __slots__ = ("x", "y", "z", "vx", "vy", "vz", "yaw", "pitch",
-                 "health", "charge", "on_ground", "sprinting", "was_hit")
+                 "health", "charge", "on_ground", "sprinting", "was_hit", "aim_lock")
 
     def reset(self, x, z, yaw):
         self.x, self.y, self.z = x, 0.0, z
@@ -133,6 +133,7 @@ class Bot:
         self.on_ground = True
         self.sprinting = False
         self.was_hit = False
+        self.aim_lock = False
 
 
 class DuelEnv:
@@ -282,11 +283,20 @@ class DuelEnv:
         return dbucket, dirbucket
 
     def state_index(self, me, opp):
-        """Java-faithful discrete state: distance bucket (3) x direction bucket (8) -> 0..23."""
-        dbucket, dirbucket = self._state_buckets(me, opp)
-        return dbucket * 8 + dirbucket
+        """Discrete tabular state: distance(3) x direction(8) x charged(2) -> 0..47.
 
-    NUM_STATES = 24
+        The charged bit (charge > FULL_STRENGTH) lets the agent SEE whether its next swing can
+        actually deal damage, so it can LEARN to wait out the ~12-tick attack cooldown instead of
+        spam-swinging. Swinging while uncharged is still allowed (it just whiffs) -- nothing is
+        gated; the agent simply now has the state bit needed to prefer waiting. Without it,
+        'near+aligned' looks identical whether charged or not, so attacking every tick is optimal
+        (only ~1 in 12 swings lands). Extends the Java 24-state (distance x direction), which
+        omitted charge."""
+        dbucket, dirbucket = self._state_buckets(me, opp)
+        charged = 1 if me.charge > FULL_STRENGTH else 0
+        return charged * 24 + dbucket * 8 + dirbucket
+
+    NUM_STATES = 48
 
     # ------------------------------------------------------------- actions
     def _apply_action(self, bot, opp, a):
@@ -317,45 +327,74 @@ class DuelEnv:
                 bot.vy = JUMP_VELOCITY
                 bot.on_ground = False
         elif a == YAW_L:
+            bot.aim_lock = False
             bot.yaw = _wrap_deg(bot.yaw - YAW_STEP)
         elif a == YAW_R:
+            bot.aim_lock = False
             bot.yaw = _wrap_deg(bot.yaw + YAW_STEP)
         elif a == YAW_L_FINE:
+            bot.aim_lock = False
             bot.yaw = _wrap_deg(bot.yaw - YAW_STEP_FINE)
         elif a == YAW_R_FINE:
+            bot.aim_lock = False
             bot.yaw = _wrap_deg(bot.yaw + YAW_STEP_FINE)
         elif a == PITCH_UP:
+            bot.aim_lock = False
             bot.pitch = max(-90.0, bot.pitch - PITCH_STEP)
         elif a == PITCH_DOWN:
+            bot.aim_lock = False
             bot.pitch = min(90.0, bot.pitch + PITCH_STEP)
         elif a == LOOK_AT_TARGET:
-            dx, dz, dy = opp.x - bot.x, opp.z - bot.z, opp.y - bot.y
-            bot.yaw = math.degrees(math.atan2(dz, dx))
-            bot.pitch = -math.degrees(math.atan2(dy, math.hypot(dx, dz)))
+            # Sticky: latch auto-tracking on. The bot now keeps its aim snapped onto the target
+            # every tick (see the tail of this method) until it chooses a manual rotation action
+            # (YAW_*/PITCH_*), which releases the lock and hands rotation back to the policy.
+            # This lets a greedy tabular policy aim WITHOUT sequencing look->attack in one state:
+            # it can LOOK in an approach state and the aim persists into the near+charged state
+            # where it attacks.
+            bot.aim_lock = True
+            self._snap_aim(bot, opp)
         # IDLE: nothing
+
+        # While latched, re-track the target every tick regardless of the (non-rotation) action
+        # taken, so aim stays locked through movement/attack/idle ticks.
+        if bot.aim_lock:
+            self._snap_aim(bot, opp)
+
+    def _snap_aim(self, bot, opp):
+        dx, dz, dy = opp.x - bot.x, opp.z - bot.z, opp.y - bot.y
+        bot.yaw = math.degrees(math.atan2(dz, dx))
+        bot.pitch = -math.degrees(math.atan2(dy, math.hypot(dx, dz)))
 
     # ----------------------------------------------------------- combat
     def _perform_attack(self, att, dfn):
-        if att.charge <= FULL_STRENGTH:
-            return
+        # No charge floor: a sub-full-charge swing still lands (damage scales via 0.2+0.8*scale^2),
+        # matching the deployed mod's ActionPack.attack() which always swings at an in-reach target.
+        # The agent LEARNS to wait for charge (weak/whiffed swings waste the cooldown) rather than
+        # being physically prevented from swinging early.
         if not _ray_hits(att, dfn):
+            att.charge = 0.0            # a swing at air still consumes the charge
             return
         scale = max(0.0, min(1.0, att.charge))
         dmg = ATTACK_DAMAGE * (0.2 + 0.8 * scale * scale)
-        if (not att.on_ground) and att.vy < 0.0 and not att.sprinting:
+        # Crits require a FULL-strength swing (scale >= 1.0), matching the Java sim's
+        # fullStrengthAttack gate -- a partially-charged swing deals damage but can't crit
+        # or apply the sprint-knockback bonus.
+        full_strength = scale >= 1.0
+        if full_strength and (not att.on_ground) and att.vy < 0.0 and not att.sprinting:
             dmg *= 1.5
         taken = dmg * PROTECTION_MULT
         if taken > 0.0:
             dfn.health -= taken
-            self._knockback(att, dfn)
+            self._knockback(att, dfn, full_strength)
+            att.sprinting = False       # sprint resets on a landed hit
         att.charge = 0.0
-        att.sprinting = False
 
-    def _knockback(self, att, dfn):
+    def _knockback(self, att, dfn, full_strength):
         dx, dz = dfn.x - att.x, dfn.z - att.z
         d = math.hypot(dx, dz) or 1e-6
         nx, nz = dx / d, dz / d
-        strength = BASE_KNOCKBACK + (SPRINT_KNOCKBACK if att.sprinting else 0.0)
+        # Sprint-knockback bonus only on a full-strength hit (Java: sprinting && fullStrengthAttack).
+        strength = BASE_KNOCKBACK + (SPRINT_KNOCKBACK if (att.sprinting and full_strength) else 0.0)
         dfn.vx = dfn.vx / 2.0 + nx * strength
         dfn.vz = dfn.vz / 2.0 + nz * strength
         if dfn.on_ground:
