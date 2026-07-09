@@ -3,8 +3,8 @@ Self-play duel environment for the neural-net trainer (Python port of the Java s
 
 During training, bot1 and bot2 are BOTH driven externally by the policy (shared-policy self-play),
 so the opponent is always at the agent's own skill level — there is always a learnable gradient,
-unlike training against the fixed s-tap expert (which gives a cold-start agent no foothold).
-For *measuring* absolute progress, step_eval() pits the agent (bot1) against the scripted s-tap
+unlike training against the fixed w-tap expert (which gives a cold-start agent no foothold).
+For *measuring* absolute progress, step_eval() pits the agent (bot1) against the scripted w-tap
 opponent as a fixed yardstick.
 
 Action space adds LOOK_AT_TARGET (snap exact aim) so hits are landable; full 360 yaw + pitch.
@@ -12,7 +12,7 @@ Action space adds LOOK_AT_TARGET (snap exact aim) so hits are landable; full 360
 Gym-like, symmetric:
     reset() -> (obs1, obs2)
     step(a1, a2)  -> (obs1, obs2, r1, r2, done, info)   # self-play (training)
-    step_eval(a1) -> (obs1, r1, done, info)             # vs scripted s-tap (evaluation)
+    step_eval(a1) -> (obs1, r1, done, info)             # vs scripted w-tap (evaluation)
 """
 
 import math
@@ -41,10 +41,15 @@ PROTECTION_MULT = 0.30
 BASE_KNOCKBACK = 0.4
 SPRINT_KNOCKBACK = 0.5
 
-# scripted s-tap opponent (eval yardstick only)
-S_TAP_MEAN = 3.0
-S_TAP_STDDEV = 0.75
-S_TAP_MAX = 5
+# scripted w-tap opponent (eval yardstick only)
+# w-tapper keeps forward pressure and briefly releases sprint after a landed
+# hit to reset it, so the next hit lands with sprint knockback again.
+W_TAP_RESET_TICKS = 1
+# attack range sampled per hit from a Gaussian peaked at 3.0, clamped to [2.0, 3.0]
+W_TAP_RANGE_MEAN = 3.0
+W_TAP_RANGE_STDDEV = 0.4
+W_TAP_RANGE_MIN = 2.0
+W_TAP_RANGE_MAX = 3.0
 
 MAX_HEALTH = 20.0
 
@@ -160,7 +165,8 @@ class DuelEnv:
         self.bot1.reset(0.0, 0.0, 0.0)
         self.bot2.reset(10.0, 0.0, 180.0)
         self.steps = 0
-        self._stap_ticks = 0
+        self._wtap_reset = 0
+        self._attack_range = self._sample_attack_range()
         self._prev_dist = self._dist()
         self._prev_aim1 = self._aim_error(self.bot1, self.bot2)
         self._prev_aim2 = self._aim_error(self.bot2, self.bot1)
@@ -198,7 +204,7 @@ class DuelEnv:
         info = {"dmg_dealt": d2, "dmg_taken": d1}
         return self._observe(self.bot1, self.bot2), self._observe(self.bot2, self.bot1), r1, r2, done, info
 
-    # ------------------------------------------- eval step (vs scripted s-tap)
+    # ------------------------------------------- eval step (vs scripted w-tap)
     def step_eval(self, a1):
         self.bot1.was_hit = self.bot2.was_hit = False
         hp1, hp2 = self.bot1.health, self.bot2.health
@@ -406,6 +412,10 @@ class DuelEnv:
         b.charge = min(1.0, b.charge + CHARGE_PER_TICK)
 
     # ----------------------------------------------- scripted opponent (eval)
+    def _sample_attack_range(self):
+        sampled = W_TAP_RANGE_MEAN + self.rng.normal() * W_TAP_RANGE_STDDEV
+        return max(W_TAP_RANGE_MIN, min(W_TAP_RANGE_MAX, sampled))
+
     def _opponent_ai(self):
         b1, b2 = self.bot1, self.bot2
         dx, dy, dz = b1.x - b2.x, b1.y - b2.y, b1.z - b2.z
@@ -413,20 +423,27 @@ class DuelEnv:
         b2.pitch = -math.degrees(math.atan2(dy, math.hypot(dx, dz)))
         yaw = math.radians(b2.yaw)
         walk = WALK_IMPULSE
-        if self._stap_ticks > 0:
-            self._stap_ticks -= 1
+        # w-tap: keep advancing; the tap is a brief non-sprint tick after a hit
+        # to reset sprint so the following hit lands with sprint knockback again.
+        if self._wtap_reset > 0:
+            self._wtap_reset -= 1
             b2.sprinting = False
-            b2.vx -= math.cos(yaw) * walk
-            b2.vz -= math.sin(yaw) * walk
+            b2.vx += math.cos(yaw) * walk
+            b2.vz += math.sin(yaw) * walk
         else:
             b2.sprinting = True
             b2.vx += math.cos(yaw) * walk * SPRINT_MULTIPLIER
             b2.vz += math.sin(yaw) * walk * SPRINT_MULTIPLIER
-        before = b2.charge
-        self._perform_attack(b2, b1)
-        if b2.charge < before:
-            sampled = S_TAP_MEAN + self.rng.normal() * S_TAP_STDDEV
-            self._stap_ticks = int(round(max(1.0, min(float(S_TAP_MAX), sampled))))
+        # Swing only when in range AND fully charged (charge >= 1.0). Attacking while sprinting
+        # at full charge is what delivers the sprint-knockback bonus (see _perform_attack); a
+        # partial-charge spam swing would land weak and never knock back. This gives the w-tapper
+        # correct hit timing: sprint in -> hit at full charge -> tap (sprint reset) -> repeat.
+        if self._dist() <= self._attack_range and b2.charge >= 1.0:
+            before = b2.charge
+            self._perform_attack(b2, b1)
+            if b2.charge < before:
+                self._wtap_reset = W_TAP_RESET_TICKS
+                self._attack_range = self._sample_attack_range()
 
     # ------------------------------------------------------- physics
     def _physics(self, b):
