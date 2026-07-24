@@ -62,12 +62,16 @@ class ParameterizedFSM(Opponent):
       wait_for_charge    : only swing when fully charged (charge >= 1.0) so hits land at full
                            strength while sprinting -> correct sprint-knockback timing
       stap_ticks         : post-hit backward tap length (the s-tap reset); 0 disables it
+      bait               : when in reach but still recharging, RETREAT out of reach to charge
+                           safely instead of holding. Beats a stationary spam-clicker ("turtle"),
+                           which chips anything sitting in its reach: bait charges outside the
+                           turtle's reach, then lunges in for one full-charge sprint-knockback hit.
     """
 
     DEFAULTS = dict(
         preferred_distance=2.5, band=0.75, attack_prob=0.8, retreat_prob=0.1,
         strafe_prob=0.15, jump_prob=0.02, pause_prob=0.0, pause_ticks=0, aim_tol=0.25,
-        wait_for_charge=False, stap_ticks=0,
+        wait_for_charge=False, stap_ticks=0, bait=False,
     )
 
     def __init__(self, name="fsm", seed=0, **params):
@@ -109,19 +113,12 @@ class ParameterizedFSM(Opponent):
         dist = math.hypot(opp.x - me.x, opp.z - me.z)
         rng = self.rng
 
-        # 4) Occasional jump (movement variety / knockback dodging).
-        if rng.random() < p["jump_prob"]:
-            return JUMP
-
-        # 5) Spacing control.
-        if dist > p["preferred_distance"] + p["band"]:
-            self._counts["approach"] += 1
-            return SPRINT_FORWARD
-        if dist < p["preferred_distance"] - p["band"] and rng.random() < p["retreat_prob"]:
-            self._counts["retreat"] += 1
-            return BACK
-
-        # 6) In-band behavior: attack (only at full charge if wait_for_charge), strafe, or pause.
+        # 4) Punish at the REACH edge FIRST. If a hit can land right now (in reach, charged when
+        #    wait_for_charge, already aimed by step 1), swing before any spacing/jump decision.
+        #    A landed hit knocks an approacher back to the reach boundary; the OLD spacing-first
+        #    order then re-APPROACHED from there instead of swinging, so a stationary spam-clicker
+        #    (the "turtle") chipped the FSM for free and was never punished. Swinging at the edge
+        #    lands the full-charge sprint-knockback punish that actually beats the turtle.
         ready = (me.charge >= 1.0) if p["wait_for_charge"] else True
         if dist <= REACH and ready and rng.random() < p["attack_prob"]:
             self._counts["attack"] += 1
@@ -129,11 +126,29 @@ class ParameterizedFSM(Opponent):
                 self._stap = p["stap_ticks"]   # schedule the post-hit sprint-reset tap
             return ATTACK
         if dist <= REACH and not ready:
-            # In reach but the attack is still recharging: hold with IDLE, which PRESERVES the
-            # sprint flag (unlike strafe/back), so the eventual full-charge hit still lands the
-            # sprint-knockback bonus. This is the core of correct hit timing.
+            if p["bait"]:
+                # Recharging inside the turtle's reach is a losing trade (it chips every tick).
+                # Back out of reach to charge safely, then lunge in for the punish next cycle.
+                self._counts["retreat"] += 1
+                return BACK
+            # Otherwise hold with IDLE, which PRESERVES the sprint flag (unlike strafe/back) so the
+            # eventual full-charge hit still lands the sprint-knockback bonus (correct hit timing).
             self._counts["idle"] += 1
             return IDLE
+
+        # 5) Occasional jump (movement variety / knockback dodging).
+        if rng.random() < p["jump_prob"]:
+            return JUMP
+
+        # 6) Spacing control (out of reach): approach, or retreat if closer than preferred.
+        if dist > p["preferred_distance"] + p["band"]:
+            self._counts["approach"] += 1
+            return SPRINT_FORWARD
+        if dist < p["preferred_distance"] - p["band"] and rng.random() < p["retreat_prob"]:
+            self._counts["retreat"] += 1
+            return BACK
+
+        # 7) In-band variety: strafe or a brief pause (the unpredictable spacing the teacher wants).
         if rng.random() < p["strafe_prob"]:
             self._counts["strafe"] += 1
             return STRAFE_LEFT if rng.random() < 0.5 else STRAFE_RIGHT
@@ -215,6 +230,13 @@ class AdaptiveTeacher(Opponent):
                          strafe_prob=0.3, jump_prob=0.06, pause_prob=0.08, pause_ticks=5),
         "feint":    dict(preferred_distance=2.4, band=0.45, attack_prob=0.75, retreat_prob=0.2,
                          strafe_prob=0.25, jump_prob=0.04, pause_prob=0.3, pause_ticks=6),
+        # Anti-turtle: baits from just outside reach, charges safely (bait=True backs off instead
+        # of sitting in the spam-clicker's reach), then lunges in for a decisive full-charge
+        # sprint-knockback hit at varied timing. The bandit selects this when the learner adopts
+        # the stand-still-and-spam turtle -- which the other (approach-into-reach) modes reward.
+        "punish":   dict(preferred_distance=3.2, band=0.35, attack_prob=0.95, retreat_prob=0.6,
+                         strafe_prob=0.3, jump_prob=0.06, pause_prob=0.1, pause_ticks=3,
+                         wait_for_charge=True, stap_ticks=2, bait=True),
     }
 
     def __init__(self, name="teacher", seed=0, ucb_c=0.7, ema_alpha=0.15, count_discount=0.99):
