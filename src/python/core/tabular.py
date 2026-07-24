@@ -61,20 +61,32 @@ class QTable:
 
 class TabularQLearner:
     """Q-learning agent with the shared learner API. Update rule mirrors Agent.learn():
-    Q(s,a) += lr * (r + gamma * max_a' Q(s',a') * (1-done) - Q(s,a)).
-    """
+    Q(s,a) += lr(s,a) * (r + gamma * max_a' Q(s',a') * (1-done) - Q(s,a)).
+
+    The learning rate is ANNEALED per (state, action) by visit count:
+        lr(s,a) = max(lr_end, lr_start / (1 + n(s,a) * lr_decay)).
+    A constant lr (the old fixed 0.1) never lets a cell settle: every episode yanks Q(s,a) by
+    10% of the TD error against a STOCHASTIC opponent, so the greedy action inside a coarse
+    48-cell bucket keeps flipping between evals -> the jagged, non-converging health_diff curve.
+    Count-based annealing is the classic Robbins-Monro condition for tabular Q-learning to
+    converge: early visits move fast (learn), later visits move little (stabilize the policy) as
+    epsilon drops. Set lr_decay=0 to recover the old fixed-lr behavior."""
 
     def __init__(self, num_states, num_actions=NUM_ACTIONS, *,
-                 lr=0.1, gamma=0.9, eps_start=1.0, eps_end=0.05, eps_decay=0.9995,
-                 seed=0):
+                 lr=0.1, lr_end=0.01, lr_decay=0.002, gamma=0.9,
+                 eps_start=1.0, eps_end=0.05, eps_decay=0.9995, seed=0):
         self.table = QTable(num_states, num_actions)
         self.num_actions = num_actions
-        self.lr = lr
+        self.lr = lr                 # starting (max) learning rate
+        self.lr_end = lr_end         # floor so a non-stationary opponent stays trackable
+        self.lr_decay = lr_decay     # visit-count anneal speed (0 -> constant lr)
         self.gamma = gamma
         self.eps = eps_start
         self.eps_end = eps_end
         self.eps_decay = eps_decay
         self.rng = random.Random(seed)
+        # Per-(s,a) visit counts drive the annealing schedule.
+        self.counts = [[0] * num_actions for _ in range(num_states)]
 
     def act(self, s, greedy=False):
         if (not greedy) and self.rng.random() < self.eps:
@@ -85,7 +97,9 @@ class TabularQLearner:
         """One Q-update. Returns |TD error| (the H1 secondary metric)."""
         target = r + (0.0 if done else self.gamma * self.table.max_q(s2))
         td = target - self.table.q[s][a]
-        self.table.q[s][a] += self.lr * td
+        self.counts[s][a] += 1
+        lr = max(self.lr_end, self.lr / (1.0 + self.counts[s][a] * self.lr_decay))
+        self.table.q[s][a] += lr * td
         return abs(td)
 
     def decay_epsilon(self):

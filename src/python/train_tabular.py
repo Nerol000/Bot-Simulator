@@ -19,15 +19,17 @@ import numpy as np
 
 from environment import DuelEnv, NUM_ACTIONS, MAX_HEALTH
 from core.tabular import TabularQLearner
-from core.opponents import ParameterizedFSM, SnapshotOpponent
+from core.opponents import ParameterizedFSM, AdaptiveTeacher, SnapshotOpponent
 
 CKPT = "qtable.csv"
 
 OPPONENTS = {
     "champion": ParameterizedFSM.champion,
-    "teacher": ParameterizedFSM.teacher,
+    # teacher/td_error now adapt online to MAXIMIZE the learner's TD error (bandit over FSM
+    # modes) rather than a single static preset whose avg_td overlapped the champion's.
+    "teacher": AdaptiveTeacher,
     "win_max": ParameterizedFSM.win_max,
-    "td_error": ParameterizedFSM.td_error,
+    "td_error": AdaptiveTeacher,
     "selfplay": SnapshotOpponent,
 }
 
@@ -87,6 +89,9 @@ def main():
                     help="[selfplay] episodes between freezing the learner into the snapshot pool")
     ap.add_argument("--pool-size", type=int, default=5,
                     help="[selfplay] number of past-self snapshots to keep and sample from")
+    ap.add_argument("--fallback-prob", type=float, default=0.3,
+                    help="[selfplay] fraction of episodes played vs the scripted anchor (even "
+                         "after the pool fills) so a gradient toward the eval opponent survives")
     # Output naming: each run writes distinct files so a seed/opponent sweep never clobbers
     # itself. Default tag encodes the params -> e.g. runs/teacher_s3_ep20000_best.csv.
     ap.add_argument("--out-dir", default="runs",
@@ -118,15 +123,23 @@ def main():
     ckpt_best = os.path.join(args.out_dir, f"{tag}_best.csv")
     metrics_path = os.path.join(args.out_dir, f"{tag}_metrics.csv")
     with open(metrics_path, "w", encoding="utf-8") as mf:
-        mf.write("episode,avg_td,health_diff,win_rate,dmg_ratio,avg_steps\n")
+        mf.write("episode,avg_td,health_diff,hdiff_ema,hdiff_best,win_rate,dmg_ratio,avg_steps\n")
     print(f"[run] tag={tag}  opponent={args.opponent}  seed={args.seed}  episodes={args.episodes}")
 
     opponent = OPPONENTS[args.opponent](seed=args.seed)
     if isinstance(opponent, SnapshotOpponent):
         opponent.pool = deque(maxlen=args.pool_size)
+        opponent.fallback_prob = args.fallback_prob
     is_selfplay = isinstance(opponent, SnapshotOpponent)
+    # An AdaptiveTeacher steers its FSM mode by the learner's TD error, so feed it each step.
+    opp_feedback = getattr(opponent, "feedback", None)
     best_score = -1e9
-    recent_td = []
+    # Smoothed learning-curve trackers so plots reflect progress, not per-eval noise: an EMA of
+    # health_diff and the running best-so-far (monotonic). The raw latest-eval line swings wildly
+    # because the greedy policy sits on decision boundaries; these two are the signal.
+    hdiff_ema = None
+    hdiff_best = -1e9
+    recent_td = deque(maxlen=5000)   # rolling window for avg_td (bounded -> constant memory)
     t0 = time.time()
 
     for ep in range(args.episodes):
@@ -140,6 +153,8 @@ def main():
             s2 = env.state_index(env.bot1, env.bot2)
             td = learner.observe(s, a, r, s2, float(done))
             recent_td.append(td)
+            if opp_feedback is not None:
+                opp_feedback(td)
         learner.decay_epsilon()
 
         # Self-play: periodically freeze the current learner into the past-self pool.
@@ -147,23 +162,26 @@ def main():
             opponent.add_snapshot(learner.table)
 
         if (ep + 1) % args.log_every == 0:
-            avg_td = np.mean(recent_td[-5000:])
+            avg_td = np.mean(recent_td)
             sps = (ep + 1) / (time.time() - t0)
             print(f"ep {ep+1:6d}  avg_td={avg_td:7.3f}  eps={learner.eps:.3f}  {sps:.1f} ep/s")
 
         if (ep + 1) % args.eval_every == 0:
             m = evaluate(env, learner)
-            avg_td = float(np.mean(recent_td[-5000:])) if recent_td else 0.0
-            print(f"  [eval vs w-tap] hdiff={m['health_diff']:+.3f}  win={m['win_rate']:.0%}  "
-                  f"dmg-ratio={m['dmg_ratio']:.2f}  ttk={m['avg_steps']:.0f}t")
+            avg_td = float(np.mean(recent_td)) if recent_td else 0.0
+            hd = m["health_diff"]
+            hdiff_ema = hd if hdiff_ema is None else 0.3 * hd + 0.7 * hdiff_ema
+            hdiff_best = max(hdiff_best, hd)
+            print(f"  [eval vs w-tap] hdiff={hd:+.3f}  ema={hdiff_ema:+.3f}  best={hdiff_best:+.3f}  "
+                  f"win={m['win_rate']:.0%}  dmg-ratio={m['dmg_ratio']:.2f}  ttk={m['avg_steps']:.0f}t")
             with open(metrics_path, "a", encoding="utf-8") as mf:
-                mf.write(f"{ep+1},{avg_td:.6f},{m['health_diff']:.6f},{m['win_rate']:.6f},"
-                         f"{m['dmg_ratio']:.6f},{m['avg_steps']:.3f}\n")
+                mf.write(f"{ep+1},{avg_td:.6f},{hd:.6f},{hdiff_ema:.6f},{hdiff_best:.6f},"
+                         f"{m['win_rate']:.6f},{m['dmg_ratio']:.6f},{m['avg_steps']:.3f}\n")
             learner.save(ckpt)
-            if m["health_diff"] > best_score:
-                best_score = m["health_diff"]
+            if hd > best_score:
+                best_score = hd
                 learner.save(ckpt_best)
-                print(f"  new best health-diff {m['health_diff']:+.3f}")
+                print(f"  new best health-diff {hd:+.3f}")
 
     learner.save(ckpt)
     print(f"Done. Saved {ckpt}  (best: {ckpt_best}, metrics: {metrics_path})")

@@ -10,6 +10,11 @@ search will optimize:
   - H1: win_max() (aggressive, win-seeking) vs td_error() (varied, challenge-seeking)
   - H2: champion() (optimize win rate) vs teacher() (optimize learner improvement)
 win_max/champion and td_error/teacher are aliases so both hypotheses share one implementation.
+
+AdaptiveTeacher is the TD-Error / Teacher arm proper: instead of a single hand-tuned "hard to
+predict" genome (whose avg_td overlaps the champion's because what surprises the learner drifts
+as it improves), it runs a non-stationary bandit over a BANK of ParameterizedFSM behavior modes
+and each episode plays the mode that currently maximizes the learner's measured |TD error|.
 """
 
 import copy
@@ -180,6 +185,100 @@ class ParameterizedFSM(Opponent):
     td_error = teacher
 
 
+class AdaptiveTeacher(Opponent):
+    """A teacher that ACTUALLY maximizes the learner's TD error instead of hoping one hand-tuned
+    FSM preset does. The static ParameterizedFSM.teacher only *guesses* at a "hard to predict"
+    genome, so its avg_td ends up overlapping the champion's: what surprises the learner keeps
+    changing as it improves, and no fixed genome tracks that moving target.
+
+    Instead this drives bot2 with a BANK of distinct FSM behavior modes (pressure / evasive /
+    erratic / counter / feint) and runs a non-stationary bandit over them, where each mode's
+    reward is the mean per-tick |TD error| the learner incurred while that mode was active. Each
+    episode it plays the mode that currently maximizes the learner's TD error (discounted-UCB, so
+    stale modes get re-examined as the learner adapts and old surprises wear off). The trainer
+    feeds the signal back via feedback(td); reset() commits the finished episode's reward and
+    selects the next mode. Because the reward IS the learner's TD error, disengaged/distant modes
+    (near-zero TD, the failure mode we observed) are self-pruned without hand-coding engagement.
+    This is the H1 TD-Error arm and the H2 Teacher arm."""
+
+    # Behavior modes = FSM genomes spanning DIFFERENT ways to surprise the learner. The bandit,
+    # not a human, decides which one is hardest to predict for the current learner.
+    MODES = {
+        "pressure": dict(preferred_distance=2.2, band=0.5, attack_prob=0.9, retreat_prob=0.05,
+                         strafe_prob=0.2, jump_prob=0.05, pause_prob=0.0, pause_ticks=0,
+                         wait_for_charge=True, stap_ticks=1),
+        "evasive":  dict(preferred_distance=3.2, band=0.6, attack_prob=0.5, retreat_prob=0.5,
+                         strafe_prob=0.6, jump_prob=0.10, pause_prob=0.05, pause_ticks=3),
+        "erratic":  dict(preferred_distance=2.5, band=0.4, attack_prob=0.55, retreat_prob=0.35,
+                         strafe_prob=0.5, jump_prob=0.12, pause_prob=0.15, pause_ticks=4),
+        "counter":  dict(preferred_distance=2.6, band=0.5, attack_prob=0.7, retreat_prob=0.4,
+                         strafe_prob=0.3, jump_prob=0.06, pause_prob=0.08, pause_ticks=5),
+        "feint":    dict(preferred_distance=2.4, band=0.45, attack_prob=0.75, retreat_prob=0.2,
+                         strafe_prob=0.25, jump_prob=0.04, pause_prob=0.3, pause_ticks=6),
+    }
+
+    def __init__(self, name="teacher", seed=0, ucb_c=0.7, ema_alpha=0.15, count_discount=0.99):
+        self.name = name
+        self.rng = random.Random(seed)
+        self.ucb_c = ucb_c            # UCB exploration weight over modes
+        self.ema_alpha = ema_alpha    # step size for each mode's TD-value estimate (non-stationary)
+        self.count_discount = count_discount  # decays visit counts so modes get re-tried over time
+        self._modes = list(self.MODES)
+        # One reusable FSM whose genome we swap to the active mode at each episode reset.
+        self._fsm = ParameterizedFSM(name="teacher_fsm", seed=seed)
+        # Bandit state: per-mode TD-value estimate and (discounted) visit count.
+        self._value = {m: 0.0 for m in self._modes}
+        self._count = {m: 0.0 for m in self._modes}
+        self._active = self._modes[0]
+        self._ep_td_sum = 0.0
+        self._ep_ticks = 0
+
+    def _select_mode(self):
+        # Try every mode once before trusting the value estimates.
+        for m in self._modes:
+            if self._count[m] == 0.0:
+                return m
+        log_total = math.log(sum(self._count.values()) + 1.0)
+        best_m, best_score = self._modes[0], -1e18
+        for m in self._modes:
+            score = self._value[m] + self.ucb_c * math.sqrt(log_total / self._count[m])
+            if score > best_score:
+                best_score, best_m = score, m
+        return best_m
+
+    def _commit_episode(self):
+        """Fold the just-finished episode's mean TD into the active mode's bandit stats."""
+        if self._ep_ticks == 0:
+            return
+        reward = self._ep_td_sum / self._ep_ticks   # mean per-tick |TD error| under this mode
+        for m in self._modes:                        # decay all counts -> non-stationary bandit
+            self._count[m] *= self.count_discount
+        self._count[self._active] += 1.0
+        self._value[self._active] += self.ema_alpha * (reward - self._value[self._active])
+
+    def feedback(self, td):
+        """Called by the trainer after every learner update with that step's |TD error|."""
+        self._ep_td_sum += td
+        self._ep_ticks += 1
+
+    def reset(self):
+        # Commit the finished episode, then pick the mode that currently maximizes learner TD.
+        self._commit_episode()
+        self._ep_td_sum = 0.0
+        self._ep_ticks = 0
+        self._active = self._select_mode()
+        self._fsm.params = {**ParameterizedFSM.DEFAULTS, **self.MODES[self._active]}
+        self._fsm.reset()
+
+    def act(self, env, me, opp) -> int:
+        return self._fsm.act(env, me, opp)
+
+    def behavior_summary(self):
+        summary = {f"td_value/{m}": self._value[m] for m in self._modes}
+        summary["active_mode"] = self._active
+        return {**self._fsm.behavior_summary(), **summary}
+
+
 class SnapshotOpponent(Opponent):
     """Self-play against FROZEN snapshots of the learner itself (prioritized fictitious
     self-play, tabular edition).
@@ -196,17 +295,23 @@ class SnapshotOpponent(Opponent):
 
     While the pool is still empty (cold start, before the first snapshot is taken) it falls back
     to `fallback` (a champion FSM by default) so two blank policies don't just flail at each
-    other and learn nothing.
+    other and learn nothing. Crucially it ALSO mixes the fallback in on a fraction
+    (`fallback_prob`) of episodes AFTER the pool fills: pure self-play collapses to health_diff=-1
+    at eval because the pool fills with mutually-weak selves that never advance or swing at full
+    charge, so the learner never experiences an aggressive sprint-attacker -- exactly what the
+    fixed w-tap EVAL opponent is. Keeping a scripted anchor in the training mix preserves a
+    gradient toward that eval distribution so the curve can actually climb instead of flat-lining.
 
     Note: unlike the FSM arms, this is a MOVING, learner-dependent target -- two seeds face
     different opponents because their own histories differ. Keep the EVALUATION opponent fixed
     (the scripted w-tapper in step_eval) so hdiff / avg_td stay comparable across all arms.
     """
 
-    def __init__(self, seed=0, pool_size=5, fallback=None):
+    def __init__(self, seed=0, pool_size=5, fallback=None, fallback_prob=0.3):
         self.rng = random.Random(seed)
         self.pool = deque(maxlen=pool_size)
         self.fallback = fallback if fallback is not None else ParameterizedFSM.champion(seed=seed)
+        self.fallback_prob = fallback_prob   # fraction of episodes played vs the scripted anchor
         self._active = None
 
     def add_snapshot(self, table):
@@ -215,10 +320,16 @@ class SnapshotOpponent(Opponent):
 
     def reset(self):
         self.fallback.reset()
-        self._active = self.rng.choice(self.pool) if self.pool else None
+        # Empty pool, or (with prob fallback_prob) a scheduled anchor episode -> use the scripted
+        # fallback. _active=None marks "play the fallback this episode".
+        if not self.pool or self.rng.random() < self.fallback_prob:
+            self._active = None
+        else:
+            self._active = self.rng.choice(self.pool)
 
     def act(self, env, me, opp) -> int:
-        # Empty pool -> lean on the scripted fallback so cold start has a real opponent.
+        # No snapshot selected this episode -> lean on the scripted anchor (cold start OR a
+        # scheduled fallback episode) so there's always aggressive pressure to learn against.
         if self._active is None:
             return self.fallback.act(env, me, opp)
         # Greedy w.r.t. the frozen snapshot, read from bot2's (=`me`) own perspective.

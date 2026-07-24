@@ -30,7 +30,7 @@ from collections import defaultdict
 # tag format from train_tabular.py: <arm>_s<seed>_ep<episodes>_metrics.csv
 _NAME_RE = re.compile(r"^(?P<arm>.+)_s(?P<seed>\d+)_ep(?P<episodes>\d+)_metrics\.csv$")
 
-METRIC_COLS = ["avg_td", "health_diff", "win_rate", "dmg_ratio", "avg_steps"]
+METRIC_COLS = ["avg_td", "health_diff", "hdiff_ema", "hdiff_best", "win_rate", "dmg_ratio", "avg_steps"]
 
 
 def _mean(xs):
@@ -61,7 +61,15 @@ def load_runs(runs_dir):
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 ep = int(row["episode"])
-                runs[arm][seed][ep] = {c: float(row[c]) for c in METRIC_COLS}
+                # Tolerate older metrics CSVs that predate the smoothed columns: default to the
+                # raw health_diff for hdiff_ema/hdiff_best, 0.0 for anything else missing.
+                def _col(c):
+                    if c in row and row[c] != "":
+                        return float(row[c])
+                    if c in ("hdiff_ema", "hdiff_best") and row.get("health_diff", "") != "":
+                        return float(row["health_diff"])
+                    return 0.0
+                runs[arm][seed][ep] = {c: _col(c) for c in METRIC_COLS}
     return runs
 
 
