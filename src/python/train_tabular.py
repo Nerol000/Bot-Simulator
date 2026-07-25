@@ -89,9 +89,13 @@ def main():
                     help="[selfplay] episodes between freezing the learner into the snapshot pool")
     ap.add_argument("--pool-size", type=int, default=5,
                     help="[selfplay] number of past-self snapshots to keep and sample from")
-    ap.add_argument("--fallback-prob", type=float, default=0.3,
-                    help="[selfplay] fraction of episodes played vs the scripted anchor (even "
-                         "after the pool fills) so a gradient toward the eval opponent survives")
+    # Annealed scripted-anchor share: start high (mostly scripted pressure, teaches aggression
+    # while lr is high) and decay to a floor (hand off to self-play, but never fully drop the
+    # anchor so gains toward the eval opponent don't erode).
+    ap.add_argument("--fallback-start", type=float, default=0.8,
+                    help="[selfplay] initial fraction of episodes vs the scripted anchor")
+    ap.add_argument("--fallback-end", type=float, default=0.25,
+                    help="[selfplay] final (floor) fraction of episodes vs the scripted anchor")
     # Output naming: each run writes distinct files so a seed/opponent sweep never clobbers
     # itself. Default tag encodes the params -> e.g. runs/teacher_s3_ep20000_best.csv.
     ap.add_argument("--out-dir", default="runs",
@@ -129,7 +133,8 @@ def main():
     opponent = OPPONENTS[args.opponent](seed=args.seed)
     if isinstance(opponent, SnapshotOpponent):
         opponent.pool = deque(maxlen=args.pool_size)
-        opponent.fallback_prob = args.fallback_prob
+        opponent.fallback_start = args.fallback_start
+        opponent.fallback_end = args.fallback_end
     is_selfplay = isinstance(opponent, SnapshotOpponent)
     # An AdaptiveTeacher steers its FSM mode by the learner's TD error, so feed it each step.
     opp_feedback = getattr(opponent, "feedback", None)
@@ -144,6 +149,10 @@ def main():
 
     for ep in range(args.episodes):
         env.reset()
+        # Anneal the self-play anchor share from fallback_start -> fallback_end over training.
+        # Must precede reset(), which reads fallback_prob to pick this episode's opponent.
+        if is_selfplay:
+            opponent.set_progress(ep / max(1, args.episodes - 1))
         opponent.reset()
         done = False
         while not done:

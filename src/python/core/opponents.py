@@ -52,7 +52,7 @@ class ParameterizedFSM(Opponent):
     Params:
       preferred_distance : combat distance it tries to hold (blocks)
       band               : tolerance around preferred_distance before it approaches/retreats
-      attack_prob        : chance to swing when in reach and aimed
+       attack_prob        : chance to swing when in reach and aimed
       retreat_prob       : chance to back off when closer than preferred
       strafe_prob        : chance to strafe when in-band
       jump_prob          : chance to jump on any tick
@@ -206,19 +206,37 @@ class AdaptiveTeacher(Opponent):
     genome, so its avg_td ends up overlapping the champion's: what surprises the learner keeps
     changing as it improves, and no fixed genome tracks that moving target.
 
-    Instead this drives bot2 with a BANK of distinct FSM behavior modes (pressure / evasive /
-    erratic / counter / feint) and runs a non-stationary bandit over them, where each mode's
-    reward is the mean per-tick |TD error| the learner incurred while that mode was active. Each
-    episode it plays the mode that currently maximizes the learner's TD error (discounted-UCB, so
-    stale modes get re-examined as the learner adapts and old surprises wear off). The trainer
-    feeds the signal back via feedback(td); reset() commits the finished episode's reward and
-    selects the next mode. Because the reward IS the learner's TD error, disengaged/distant modes
-    (near-zero TD, the failure mode we observed) are self-pruned without hand-coding engagement.
-    This is the H1 TD-Error arm and the H2 Teacher arm."""
+    This maximizes TD as a CONTINUOUS optimization, not a 6-way multiple choice. It drives bot2
+    with a POPULATION of FSM genomes and runs two coupled processes whose only objective is the
+    learner's measured |TD error|:
 
-    # Behavior modes = FSM genomes spanning DIFFERENT ways to surprise the learner. The bandit,
-    # not a human, decides which one is hardest to predict for the current learner.
-    MODES = {
+      1) Selection -- a non-stationary discounted-UCB bandit picks, each EPISODE, the genome that
+         currently maximizes the learner's mean per-tick |TD| (stale genomes get re-examined as
+         the learner adapts and old surprises wear off).
+      2) Evolution -- every `evolve_every` episodes the worst non-anchor genome is EVICTED and
+         replaced by a Gaussian mutation of a tournament-best genome. This hill-climbs the genome
+         space, so the teacher reaches high-TD genomes BETWEEN and OUTSIDE the hand presets that a
+         fixed bank can't represent. (A pure 6-mode bandit tops out ~+38% over the champion; the
+         search keeps climbing past that.)
+
+    The 6 hand genomes (pressure / evasive / erratic / counter / feint / punish) seed the
+    population as protected ANCHORS -- never evicted -- so proven behaviors (esp. the anti-turtle
+    `punish` counter) and diversity are preserved while the extra slots evolve freely.
+
+    One genome per game (not intra-episode switching) is deliberate: switching mid-game shreds the
+    FSM's own combat rhythm (s-tap / charge timing) into a weaker, MORE learnable opponent, which
+    lets the learner converge and DROPS its TD -- the opposite of the goal (we measured teacher
+    avg_td falling BELOW the champion's when switching every 25 ticks). Whole-episode credit keeps
+    each genome's coherent pressure, which is what actually sustains high learner TD.
+
+    The trainer feeds the signal via feedback(td); reset() commits the reward, evolves, and
+    re-selects. Because the reward IS the learner's TD, disengaged/distant genomes (near-zero TD,
+    the failure mode we observed) are out-competed and bred out automatically. This is the H1
+    TD-Error arm and the H2 Teacher arm."""
+
+    # Hand genomes = protected ANCHORS seeding the population (the bandit+evolution take it from
+    # here). Diverse ways to surprise the learner; `punish` is the anti-turtle counter.
+    SEED_MODES = {
         "pressure": dict(preferred_distance=2.2, band=0.5, attack_prob=0.9, retreat_prob=0.05,
                          strafe_prob=0.2, jump_prob=0.05, pause_prob=0.0, pause_ticks=0,
                          wait_for_charge=True, stap_ticks=1),
@@ -230,53 +248,140 @@ class AdaptiveTeacher(Opponent):
                          strafe_prob=0.3, jump_prob=0.06, pause_prob=0.08, pause_ticks=5),
         "feint":    dict(preferred_distance=2.4, band=0.45, attack_prob=0.75, retreat_prob=0.2,
                          strafe_prob=0.25, jump_prob=0.04, pause_prob=0.3, pause_ticks=6),
-        # Anti-turtle: baits from just outside reach, charges safely (bait=True backs off instead
-        # of sitting in the spam-clicker's reach), then lunges in for a decisive full-charge
-        # sprint-knockback hit at varied timing. The bandit selects this when the learner adopts
-        # the stand-still-and-spam turtle -- which the other (approach-into-reach) modes reward.
         "punish":   dict(preferred_distance=3.2, band=0.35, attack_prob=0.95, retreat_prob=0.6,
                          strafe_prob=0.3, jump_prob=0.06, pause_prob=0.1, pause_ticks=3,
                          wait_for_charge=True, stap_ticks=2, bait=True),
     }
 
-    def __init__(self, name="teacher", seed=0, ucb_c=0.7, ema_alpha=0.15, count_discount=0.99):
+    # Search space for evolution: continuous knobs as (lo, hi), integer knobs as (lo, hi, "int"),
+    # and boolean knobs listed separately (mutated by an occasional flip).
+    PARAM_SPACE = {
+        "preferred_distance": (1.5, 4.0), "band": (0.2, 1.0), "attack_prob": (0.3, 1.0),
+        "retreat_prob": (0.0, 0.8), "strafe_prob": (0.0, 0.8), "jump_prob": (0.0, 0.2),
+        "pause_prob": (0.0, 0.4), "pause_ticks": (0, 8, "int"), "stap_ticks": (0, 3, "int"),
+    }
+    BOOL_PARAMS = ("wait_for_charge", "bait")
+
+    def __init__(self, name="teacher", seed=0, ucb_c=0.7, ema_alpha=0.15, count_discount=0.99,
+                 pop_size=12, evolve_every=40, mutate_scale=0.2, flip_prob=0.1, min_evals=3):
         self.name = name
         self.rng = random.Random(seed)
-        self.ucb_c = ucb_c            # UCB exploration weight over modes
-        self.ema_alpha = ema_alpha    # step size for each mode's TD-value estimate (non-stationary)
-        self.count_discount = count_discount  # decays visit counts so modes get re-tried over time
-        self._modes = list(self.MODES)
-        # One reusable FSM whose genome we swap to the active mode at each episode reset.
+        self.ucb_c = ucb_c            # UCB exploration weight over genomes
+        self.ema_alpha = ema_alpha    # step size for each genome's TD-value estimate (non-stationary)
+        self.count_discount = count_discount  # decays visit counts so genomes get re-tried over time
+        self.pop_size = max(pop_size, len(self.SEED_MODES))
+        self.evolve_every = evolve_every   # committed episodes between evolution steps
+        self.mutate_scale = mutate_scale   # Gaussian std as a fraction of each param's range
+        self.flip_prob = flip_prob         # per-bool chance to flip on mutation
+        self.min_evals = min_evals         # min count before a genome can breed or be evicted
         self._fsm = ParameterizedFSM(name="teacher_fsm", seed=seed)
-        # Bandit state: per-mode TD-value estimate and (discounted) visit count.
-        self._value = {m: 0.0 for m in self._modes}
-        self._count = {m: 0.0 for m in self._modes}
-        self._active = self._modes[0]
+
+        # Population: id -> genome (full param dict). Anchors are the seed modes, kept forever.
+        self._genome = {}
+        self._anchor = set()
+        self._value = {}
+        self._count = {}
+        for gid, params in self.SEED_MODES.items():
+            self._genome[gid] = {**ParameterizedFSM.DEFAULTS, **params}
+            self._anchor.add(gid)
+            self._value[gid] = 0.0
+            self._count[gid] = 0.0
+        # Fill remaining slots with random genomes to explore beyond the hand presets.
+        self._next_id = 0
+        while len(self._genome) < self.pop_size:
+            self._add_genome(self._random_genome())
+
+        self._active = next(iter(self._genome))
         self._ep_td_sum = 0.0
         self._ep_ticks = 0
+        self._commits = 0
 
-    def _select_mode(self):
-        # Try every mode once before trusting the value estimates.
-        for m in self._modes:
-            if self._count[m] == 0.0:
-                return m
+    # ------------------------------------------------------------- genome ops
+    def _add_genome(self, genome):
+        gid = f"evo{self._next_id}"
+        self._next_id += 1
+        self._genome[gid] = genome
+        self._value[gid] = 0.0
+        self._count[gid] = 0.0
+        return gid
+
+    def _random_genome(self):
+        g = dict(ParameterizedFSM.DEFAULTS)
+        for k, spec in self.PARAM_SPACE.items():
+            lo, hi = spec[0], spec[1]
+            v = self.rng.uniform(lo, hi)
+            g[k] = int(round(v)) if len(spec) == 3 else v
+        for k in self.BOOL_PARAMS:
+            g[k] = self.rng.random() < 0.5
+        return g
+
+    def _mutate(self, parent):
+        g = dict(parent)
+        for k, spec in self.PARAM_SPACE.items():
+            lo, hi = spec[0], spec[1]
+            std = (hi - lo) * self.mutate_scale
+            v = g[k] + self.rng.gauss(0.0, std)
+            v = min(hi, max(lo, v))                       # clamp to bounds
+            g[k] = int(round(v)) if len(spec) == 3 else v
+        for k in self.BOOL_PARAMS:
+            if self.rng.random() < self.flip_prob:
+                g[k] = not g[k]
+        return g
+
+    def _select(self):
+        # Try every genome once before trusting the value estimates.
+        ids = list(self._genome)
+        for gid in ids:
+            if self._count[gid] == 0.0:
+                return gid
         log_total = math.log(sum(self._count.values()) + 1.0)
-        best_m, best_score = self._modes[0], -1e18
-        for m in self._modes:
-            score = self._value[m] + self.ucb_c * math.sqrt(log_total / self._count[m])
+        best_id, best_score = ids[0], -1e18
+        for gid in ids:
+            score = self._value[gid] + self.ucb_c * math.sqrt(log_total / self._count[gid])
             if score > best_score:
-                best_score, best_m = score, m
-        return best_m
+                best_score, best_id = score, gid
+        return best_id
 
+    def _evolve(self):
+        """Replace the worst-performing EVOLVED (non-anchor) genome with a mutation of a
+        tournament-best genome. Only considers genomes with >= min_evals so noisy one-off
+        estimates don't drive selection/eviction."""
+        rated = [g for g in self._genome if self._count[g] >= self.min_evals]
+        if len(rated) < 2:
+            return
+        # Parent: best of a small random tournament (favors high-TD genomes, keeps some diversity).
+        k = min(3, len(rated))
+        parent = max(self.rng.sample(rated, k), key=lambda g: self._value[g])
+        # Victim: worst evolved genome (anchors are protected). Nothing evictable -> skip.
+        evolvable = [g for g in rated if g not in self._anchor]
+        if not evolvable:
+            return
+        victim = min(evolvable, key=lambda g: self._value[g])
+        # Don't evict a genome that's better than the parent (can happen with tournament noise).
+        if self._value[victim] >= self._value[parent]:
+            return
+        del self._genome[victim], self._value[victim], self._count[victim]
+        child = self._mutate(self._genome[parent])
+        gid = self._add_genome(child)
+        # Warm-start the child near its parent so UCB doesn't force a blind re-eval from zero.
+        self._value[gid] = self._value[parent]
+
+    # ------------------------------------------------------------- bandit loop
     def _commit_episode(self):
-        """Fold the just-finished episode's mean TD into the active mode's bandit stats."""
+        """Fold the just-finished episode's mean TD into the active genome's stats, then maybe
+        evolve. Whole-episode (not intra-episode) credit on purpose: switching genome mid-game
+        breaks the FSM's own combat rhythm into a weaker, MORE learnable opponent, dropping TD
+        (measured). One genome per game preserves coherent pressure, which sustains higher TD."""
         if self._ep_ticks == 0:
             return
-        reward = self._ep_td_sum / self._ep_ticks   # mean per-tick |TD error| under this mode
-        for m in self._modes:                        # decay all counts -> non-stationary bandit
-            self._count[m] *= self.count_discount
+        reward = self._ep_td_sum / self._ep_ticks   # mean per-tick |TD error| under this genome
+        for gid in self._genome:                      # decay all counts -> non-stationary bandit
+            self._count[gid] *= self.count_discount
         self._count[self._active] += 1.0
         self._value[self._active] += self.ema_alpha * (reward - self._value[self._active])
+        self._commits += 1
+        if self._commits % self.evolve_every == 0:
+            self._evolve()
 
     def feedback(self, td):
         """Called by the trainer after every learner update with that step's |TD error|."""
@@ -284,20 +389,25 @@ class AdaptiveTeacher(Opponent):
         self._ep_ticks += 1
 
     def reset(self):
-        # Commit the finished episode, then pick the mode that currently maximizes learner TD.
+        # Commit the finished episode (may evolve), then pick the genome maximizing learner TD.
         self._commit_episode()
         self._ep_td_sum = 0.0
         self._ep_ticks = 0
-        self._active = self._select_mode()
-        self._fsm.params = {**ParameterizedFSM.DEFAULTS, **self.MODES[self._active]}
+        self._active = self._select()
+        self._fsm.params = {**ParameterizedFSM.DEFAULTS, **self._genome[self._active]}
         self._fsm.reset()
 
     def act(self, env, me, opp) -> int:
         return self._fsm.act(env, me, opp)
 
     def behavior_summary(self):
-        summary = {f"td_value/{m}": self._value[m] for m in self._modes}
-        summary["active_mode"] = self._active
+        best = max(self._genome, key=lambda g: self._value[g])
+        summary = {
+            "active_genome": self._active,
+            "pop_size": len(self._genome),
+            "best_td_value": self._value[best],
+            "best_genome": best,
+        }
         return {**self._fsm.behavior_summary(), **summary}
 
 
@@ -324,17 +434,36 @@ class SnapshotOpponent(Opponent):
     fixed w-tap EVAL opponent is. Keeping a scripted anchor in the training mix preserves a
     gradient toward that eval distribution so the curve can actually climb instead of flat-lining.
 
+    The anchor share is ANNEALED, not constant: it starts high (`fallback_start`, mostly scripted
+    pressure) and decays to a floor (`fallback_end`) as training progresses -- call
+    set_progress(frac in [0,1]) each episode. A CONSTANT share collapses anyway (measured): once
+    the good aggressive policy appears, the still-large block of weak-self episodes -- combined
+    with the annealed learning rate, which by then updates too slowly to re-correct -- drags the
+    policy back to passivity and eval falls to -1. Front-loading the anchor teaches aggression
+    while lr is still high, then hands off to self-play to refine it; the floor keeps a permanent
+    gradient toward the eval distribution so gains don't erode.
+
     Note: unlike the FSM arms, this is a MOVING, learner-dependent target -- two seeds face
     different opponents because their own histories differ. Keep the EVALUATION opponent fixed
     (the scripted w-tapper in step_eval) so hdiff / avg_td stay comparable across all arms.
     """
 
-    def __init__(self, seed=0, pool_size=5, fallback=None, fallback_prob=0.3):
+    def __init__(self, seed=0, pool_size=5, fallback=None,
+                 fallback_start=0.8, fallback_end=0.25):
         self.rng = random.Random(seed)
         self.pool = deque(maxlen=pool_size)
         self.fallback = fallback if fallback is not None else ParameterizedFSM.champion(seed=seed)
-        self.fallback_prob = fallback_prob   # fraction of episodes played vs the scripted anchor
+        # Annealed scripted-anchor share: fallback_start -> fallback_end over training progress.
+        self.fallback_start = fallback_start
+        self.fallback_end = fallback_end
+        self.fallback_prob = fallback_start   # current share; updated via set_progress()
         self._active = None
+
+    def set_progress(self, frac):
+        """Linearly anneal the anchor share from fallback_start to fallback_end. `frac` is training
+        progress in [0, 1] (episode / total_episodes), supplied by the trainer each episode."""
+        frac = min(1.0, max(0.0, frac))
+        self.fallback_prob = self.fallback_start + (self.fallback_end - self.fallback_start) * frac
 
     def add_snapshot(self, table):
         """Freeze a deep copy of the current learner Q-table into the pool."""
