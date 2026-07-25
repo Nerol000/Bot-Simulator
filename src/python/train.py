@@ -71,6 +71,10 @@ def main():
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--eval-every", type=int, default=500)
+    # Run a gradient update once every N env ticks (every transition is still stored in the
+    # replay buffer). ~Nx faster wall-clock with negligible sample-efficiency loss, because the
+    # buffer lets each stored transition be reused across later updates.
+    ap.add_argument("--train-every", type=int, default=4)
     args = ap.parse_args()
 
     os.makedirs(CKPT_DIR, exist_ok=True)
@@ -89,6 +93,7 @@ def main():
 
     best_win = -1.0
     recent_rewards = []
+    tick = 0
     t0 = time.time()
     for ep in range(args.episodes):
         obs1, obs2 = env.reset()
@@ -101,7 +106,9 @@ def main():
             # Pool BOTH bots' experience into the shared buffer -> both perspectives improve one net.
             agent.remember(obs1, a1, r1, n1, float(done))
             agent.remember(obs2, a2, r2, n2, float(done))
-            agent.learn()
+            tick += 1
+            if tick % args.train_every == 0:
+                agent.learn()
             obs1, obs2 = n1, n2
             ep_r += r1
         agent.decay_epsilon()

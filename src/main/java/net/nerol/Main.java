@@ -33,7 +33,7 @@ public class Main {
                             + "distance,direction,stateIndex,"
                             + "action,reward"
             );*/
-            for (int episode = 0; episode < 1100100; episode++) {
+            for (int episode = 0; episode < 5000; episode++) {
                 env.reset();
                 double totalReward = 0;
                 State state = env.getCurrentState();

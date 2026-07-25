@@ -21,7 +21,7 @@ public class Gravity {
 
         // Gravity
         if (!e.onGround) {
-            e.Motion.y -= GRAVITY;
+            e.Motion.y += GRAVITY;
         }
 
         // Drag
