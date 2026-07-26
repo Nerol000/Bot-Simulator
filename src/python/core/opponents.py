@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 
 from environment import (
-    REACH, IDLE, BACK, JUMP, STRAFE_LEFT, STRAFE_RIGHT, SPRINT_FORWARD, ATTACK,
+    REACH, IDLE, BACK, JUMP, STRAFE_LEFT, STRAFE_RIGHT, SPRINT_FORWARD, FORWARD, ATTACK,
     LOOK_AT_TARGET,
 )
 
@@ -66,12 +66,18 @@ class ParameterizedFSM(Opponent):
                            safely instead of holding. Beats a stationary spam-clicker ("turtle"),
                            which chips anything sitting in its reach: bait charges outside the
                            turtle's reach, then lunges in for one full-charge sprint-knockback hit.
+      jump_reset         : turn a ready full-charge swing into an airborne CRITICAL hit (1.5x).
+                           A crit needs full charge + airborne + descending + not-sprinting
+                           (env._perform_attack), so the FSM drops sprint, jumps, waits for the
+                           fall, then swings on the way down. This punishes an opponent that camps
+                           the FSM's post-swing recharge window: each punish now crits, so the
+                           learner can no longer farm the cooldown space for a free damage trade.
     """
 
     DEFAULTS = dict(
         preferred_distance=2.5, band=0.75, attack_prob=0.8, retreat_prob=0.1,
         strafe_prob=0.15, jump_prob=0.02, pause_prob=0.0, pause_ticks=0, aim_tol=0.25,
-        wait_for_charge=False, stap_ticks=0, bait=False,
+        wait_for_charge=False, stap_ticks=0, bait=False, jump_reset=False,
     )
 
     def __init__(self, name="fsm", seed=0, **params):
@@ -80,12 +86,16 @@ class ParameterizedFSM(Opponent):
         self.rng = random.Random(seed)
         self._pause = 0
         self._stap = 0
+        self._air = 0
+        self._air_ticks = 0
         self._counts = {"attack": 0, "retreat": 0, "strafe": 0, "approach": 0, "idle": 0}
         self._ticks = 0
 
     def reset(self):
         self._pause = 0
         self._stap = 0
+        self._air = 0
+        self._air_ticks = 0
         self._counts = {k: 0 for k in self._counts}
         self._ticks = 0
 
@@ -120,6 +130,58 @@ class ParameterizedFSM(Opponent):
         #    (the "turtle") chipped the FSM for free and was never punished. Swinging at the edge
         #    lands the full-charge sprint-knockback punish that actually beats the turtle.
         ready = (me.charge >= 1.0) if p["wait_for_charge"] else True
+
+        # 4a) Jump-reset (crit) combo. A landed swing sends the FSM to 0 charge, and an opponent
+        #     that sits in that ~12.5-tick recharge window chips it for free -- "abusing the
+        #     cooldown space." The counter is to make every punish a CRITICAL hit: env grants
+        #     1.5x damage only for a full-charge swing that lands while airborne + descending +
+        #     not sprinting. So once the FSM is charged and in reach it commits a sticky combo --
+        #     drop sprint, jump, ride to the apex, then swing on the way down for the crit --
+        #     instead of a flat-footed swing. The extra 50% damage per punish flips the recharge-
+        #     window trade back in the FSM's favor. self._air keeps the combo sticky so a per-tick
+        #     rng can't abort it mid-air.
+        if p["jump_reset"] and (self._air > 0 or (dist <= REACH and me.charge >= 1.0
+                                                  and rng.random() < p["attack_prob"])):
+            # Once committed, self._air locks the combo on until the crit lands (or the target is
+            # lost), so the FSM's own spacing/sprint logic can't abort it mid-air. Bail after a
+            # few seconds so a committed combo can't walk forever chasing a kiter (the non-sprint
+            # FORWARD used mid-combo can't catch a sprinting runner) -- hand back to normal spacing.
+            self._air_ticks += 1
+            if self._air_ticks > 24:
+                self._air = 0
+                self._air_ticks = 0
+            else:
+                if not me.aim_lock:
+                    self._air = max(self._air, 1)
+                    return LOOK_AT_TARGET          # latch aim so it tracks through the whole jump
+                if me.sprinting:
+                    # crit needs not-sprinting: shed sprint with a STRAFE (aim stays locked,
+                    # distance roughly held), not a BACK that would backpedal out of reach.
+                    self._air = 1
+                    self._counts["strafe"] += 1
+                    return STRAFE_LEFT if rng.random() < 0.5 else STRAFE_RIGHT
+                if me.on_ground:
+                    self._air = 2
+                    return JUMP                        # launch
+                if me.vy >= 0.0:
+                    self._air = 3                     # rising: hold if in reach, else close (no sprint)
+                    if dist <= REACH:
+                        self._counts["idle"] += 1
+                        return IDLE
+                    self._counts["approach"] += 1
+                    return FORWARD
+                # descending (vy < 0), airborne, full charge, not sprinting:
+                if dist <= REACH:
+                    self._air = 0                     # the swing crits (1.5x)
+                    self._air_ticks = 0
+                    self._counts["attack"] += 1
+                    if p["stap_ticks"] > 0:
+                        self._stap = p["stap_ticks"]
+                    return ATTACK
+                self._air = 3                         # fell short: close in (still not sprinting)
+                self._counts["approach"] += 1
+                return FORWARD
+
         if dist <= REACH and ready and rng.random() < p["attack_prob"]:
             self._counts["attack"] += 1
             if p["stap_ticks"] > 0:
@@ -175,7 +237,7 @@ class ParameterizedFSM(Opponent):
         return cls(name="champion", seed=seed,
                    preferred_distance=2.3, band=0.6, attack_prob=0.95, retreat_prob=0.05,
                    strafe_prob=0.06, jump_prob=0.02, pause_prob=0.0, pause_ticks=0,
-                   wait_for_charge=True, stap_ticks=1)
+                   wait_for_charge=True, stap_ticks=1, jump_reset=True)
 
     @classmethod
     def teacher(cls, seed=0):
@@ -239,7 +301,7 @@ class AdaptiveTeacher(Opponent):
     SEED_MODES = {
         "pressure": dict(preferred_distance=2.2, band=0.5, attack_prob=0.9, retreat_prob=0.05,
                          strafe_prob=0.2, jump_prob=0.05, pause_prob=0.0, pause_ticks=0,
-                         wait_for_charge=True, stap_ticks=1),
+                         wait_for_charge=True, stap_ticks=1, jump_reset=True),
         "evasive":  dict(preferred_distance=3.2, band=0.6, attack_prob=0.5, retreat_prob=0.5,
                          strafe_prob=0.6, jump_prob=0.10, pause_prob=0.05, pause_ticks=3),
         "erratic":  dict(preferred_distance=2.5, band=0.4, attack_prob=0.55, retreat_prob=0.35,
@@ -250,7 +312,7 @@ class AdaptiveTeacher(Opponent):
                          strafe_prob=0.25, jump_prob=0.04, pause_prob=0.3, pause_ticks=6),
         "punish":   dict(preferred_distance=3.2, band=0.35, attack_prob=0.95, retreat_prob=0.6,
                          strafe_prob=0.3, jump_prob=0.06, pause_prob=0.1, pause_ticks=3,
-                         wait_for_charge=True, stap_ticks=2, bait=True),
+                         wait_for_charge=True, stap_ticks=2, bait=True, jump_reset=True),
     }
 
     # Search space for evolution: continuous knobs as (lo, hi), integer knobs as (lo, hi, "int"),
@@ -260,7 +322,7 @@ class AdaptiveTeacher(Opponent):
         "retreat_prob": (0.0, 0.8), "strafe_prob": (0.0, 0.8), "jump_prob": (0.0, 0.2),
         "pause_prob": (0.0, 0.4), "pause_ticks": (0, 8, "int"), "stap_ticks": (0, 3, "int"),
     }
-    BOOL_PARAMS = ("wait_for_charge", "bait")
+    BOOL_PARAMS = ("wait_for_charge", "bait", "jump_reset")
 
     def __init__(self, name="teacher", seed=0, ucb_c=0.7, ema_alpha=0.15, count_discount=0.99,
                  pop_size=12, evolve_every=40, mutate_scale=0.2, flip_prob=0.1, min_evals=3):

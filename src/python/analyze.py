@@ -7,6 +7,8 @@ emits the two experiment deliverables:
   1) A per-arm SUMMARY TABLE (final-value mean +/- std across seeds) -> stdout + summary.csv
   2) Per-arm AGGREGATED LEARNING CURVES (mean +/- std at each episode) -> agg_<arm>.csv,
      and, if matplotlib is available, health_diff.png / avg_td.png plots.
+  3) A single COMBINED long-format table (one row per arm x episode, all metrics averaged
+     across seeds) -> combined.csv, for easy brain-type vs episode comparison in one file.
 
 The metrics CSV columns are: episode, avg_td, health_diff, win_rate, dmg_ratio, avg_steps.
 
@@ -99,6 +101,22 @@ def write_agg_csv(path, rows):
         w.writeheader()
         for r in rows:
             w.writerow({k: r[k] for k in cols})
+
+
+def write_combined_csv(path, agg_by_arm):
+    """One tidy long-format table for ALL arms: a row per (arm, episode) with every metric
+    averaged across seeds. Sorted by arm then episode so you can eyeball or pivot on
+    'brain type x episode' in Excel/pandas without touching the per-arm files."""
+    cols = ["arm", "episode", "n_seeds"] + [f"{c}_{stat}" for c in METRIC_COLS for stat in ("mean", "std")]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for arm in sorted(agg_by_arm):
+            for r in agg_by_arm[arm]:
+                row = {"arm": arm}
+                row.update({k: r[k] for k in cols if k != "arm"})
+                w.writerow(row)
+    print(f"Wrote {path}")
 
 
 def print_summary(runs, agg_by_arm, out_dir):
@@ -203,6 +221,7 @@ def main():
         agg_by_arm[arm] = rows
         write_agg_csv(os.path.join(out_dir, f"agg_{arm}.csv"), rows)
 
+    write_combined_csv(os.path.join(out_dir, "combined.csv"), agg_by_arm)
     print_summary(runs, agg_by_arm, out_dir)
     print_console_curve(agg_by_arm, args.metric)
     maybe_plot(agg_by_arm, out_dir)

@@ -37,7 +37,11 @@ EYE_HEIGHT = 1.62
 ATTACK_DAMAGE = 7.0
 CHARGE_PER_TICK = 1.0 / 12.5
 FULL_STRENGTH = 0.9
-PROTECTION_MULT = 0.30
+# Kit: unenchanted diamond sword (ATTACK_DAMAGE 7.0, no Sharpness) + full diamond armor with
+# Protection IV on all four pieces. Mirrors Equipment.getProtectionDamageMultiplier() in the Java
+# sim: Protection is 1 EPF per level, EPF summed across pieces (4 x IV = 16), capped at 20, and
+# incoming damage x (1 - 0.04*EPF) -> 1 - 0.04*16 = 0.36x damage taken.
+PROTECTION_MULT = 0.36
 BASE_KNOCKBACK = 0.4
 SPRINT_KNOCKBACK = 0.5
 
