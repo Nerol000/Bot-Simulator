@@ -28,6 +28,10 @@ from environment import (
     LOOK_AT_TARGET,
 )
 
+# Minimum spacing (blocks) the FSM keeps while strafing: a strafe run circle-strafes at range,
+# and if the opponent closes inside this it reopens the gap (BACK) instead of stepping sideways.
+STRAFE_MIN_SPACING = 3.0
+
 
 class Opponent(ABC):
     """Drives bot2 (`me`) against bot1 (`opp`) for one tick by returning an action index."""
@@ -55,6 +59,12 @@ class ParameterizedFSM(Opponent):
        attack_prob        : chance to swing when in reach and aimed
       retreat_prob       : chance to back off when closer than preferred
       strafe_prob        : chance to strafe when in-band
+      strafe_ticks       : strafe WIDTH -- the MEAN hold length (ticks) of one strafe run (a
+                           sustained A or D tap). Each run's actual length is drawn from a Gaussian
+                           centered here (sigma = strafe_ticks/3), so most runs land near this
+                           width; direction is a 50/50 left/right flip. 1 = the old jittery single-
+                           tick strafe that nets almost no displacement; larger = wider sidesteps.
+                           Runs circle-strafe while keeping >= 3 block (STRAFE_MIN_SPACING) spacing.
       jump_prob          : chance to jump on any tick
       pause_prob         : chance to begin an idle pause when in-band
       pause_ticks        : length of an idle pause
@@ -66,18 +76,24 @@ class ParameterizedFSM(Opponent):
                            safely instead of holding. Beats a stationary spam-clicker ("turtle"),
                            which chips anything sitting in its reach: bait charges outside the
                            turtle's reach, then lunges in for one full-charge sprint-knockback hit.
-      jump_reset         : turn a ready full-charge swing into an airborne CRITICAL hit (1.5x).
-                           A crit needs full charge + airborne + descending + not-sprinting
-                           (env._perform_attack), so the FSM drops sprint, jumps, waits for the
-                           fall, then swings on the way down. This punishes an opponent that camps
-                           the FSM's post-swing recharge window: each punish now crits, so the
-                           learner can no longer farm the cooldown space for a free damage trade.
+      jump_reset         : anti-combo DEFENSE, SELF-CALIBRATING. In MC, a jump on the tick a hit
+                           lands lets the jump's upward velocity override the knockback pop while
+                           the standard vx/2 + push math keeps only the residual horizontal
+                           knockback (env JUMP branch) -- so a jump timed onto the hit blunts the
+                           combo. The FSM can't read the hit directly (was_hit is cleared before
+                           act()), so it INFERS each hit from its own health dropping and MEASURES
+                           the opponent's cadence itself: once it sees 3+ hits at a CONSISTENT
+                           interval it locks that period and jumps on the predicted hit ticks. If
+                           the opponent varies its timing the intervals stop agreeing, the lock
+                           drops, and it stops jumping -- so it only defends a PREDICTABLE combo and
+                           pressures the learner to hit UNPREDICTABLY. No period is configured; the
+                           frequency is discovered at runtime.
     """
 
     DEFAULTS = dict(
         preferred_distance=2.5, band=0.75, attack_prob=0.8, retreat_prob=0.1,
-        strafe_prob=0.15, jump_prob=0.02, pause_prob=0.0, pause_ticks=0, aim_tol=0.25,
-        wait_for_charge=False, stap_ticks=0, bait=False, jump_reset=False,
+        strafe_prob=0.15, strafe_ticks=4, jump_prob=0.02, pause_prob=0.0, pause_ticks=0,
+        aim_tol=0.25, wait_for_charge=False, stap_ticks=0, bait=False, jump_reset=False,
     )
 
     def __init__(self, name="fsm", seed=0, **params):
@@ -86,22 +102,58 @@ class ParameterizedFSM(Opponent):
         self.rng = random.Random(seed)
         self._pause = 0
         self._stap = 0
-        self._air = 0
-        self._air_ticks = 0
+        self._strafe = 0
+        self._strafe_dir = STRAFE_LEFT
+        self._last_health = None
+        self._hit_ticks = deque(maxlen=6)
+        self._detected_period = 0
         self._counts = {"attack": 0, "retreat": 0, "strafe": 0, "approach": 0, "idle": 0}
         self._ticks = 0
 
     def reset(self):
         self._pause = 0
         self._stap = 0
-        self._air = 0
-        self._air_ticks = 0
+        self._strafe = 0
+        self._strafe_dir = STRAFE_LEFT
+        self._last_health = None
+        self._hit_ticks = deque(maxlen=6)
+        self._detected_period = 0
         self._counts = {k: 0 for k in self._counts}
         self._ticks = 0
 
     def act(self, env, me, opp) -> int:
         p = self.params
         self._ticks += 1
+
+        # 0) Jump-reset (anti-combo DEFENSE), self-calibrating. A jump on the tick a hit lands lets
+        #    the jump's upward velocity override the knockback pop while the standard vx/2 + push
+        #    math keeps only the residual horizontal knockback (env JUMP branch), blunting the
+        #    combo. The FSM can't read the hit directly (env clears was_hit before act()), so it
+        #    INFERS each hit from its own health dropping -- damage is applied during the attacker's
+        #    earlier action, so a drop seen this tick means the hit landed LAST tick (self._ticks-1).
+        #    It MEASURES the opponent's cadence itself: once it sees 3+ hits at a consistent
+        #    interval it locks that period, then jumps on the PREDICTED next hit tick (phase-anchored
+        #    to the last observed hit) so the jump coincides with the incoming hit. If the opponent
+        #    varies its timing the last two gaps stop agreeing (or it stops hitting for >2 periods),
+        #    the lock drops, and the FSM stops jumping -- so it only defends a PREDICTABLE combo and
+        #    pressures the learner to hit UNPREDICTABLY. This runs FIRST (before the aim/stap/pause
+        #    early-returns) so hit tracking never misses a tick and the timed reset has priority.
+        if p["jump_reset"]:
+            if self._last_health is not None and me.health < self._last_health - 1e-9:
+                self._hit_ticks.append(self._ticks - 1)   # the hit actually landed last tick
+                ht = self._hit_ticks
+                if len(ht) >= 3:
+                    i1, i2 = ht[-2] - ht[-3], ht[-1] - ht[-2]
+                    # 3+ hits at the SAME frequency (last two gaps agree within a tick) -> lock it.
+                    self._detected_period = round((i1 + i2) / 2) if (i2 > 0 and abs(i1 - i2) <= 1) else 0
+            self._last_health = me.health
+            if self._detected_period > 0 and self._hit_ticks:
+                since = self._ticks - self._hit_ticks[-1]
+                if since > 2 * self._detected_period:
+                    self._detected_period = 0             # combo stopped -> drop the lock
+                elif me.on_ground and since > 0 and since % self._detected_period == 0:
+                    self._counts["idle"] += 1             # jump onto the predicted hit tick
+                    return JUMP
 
         # 1) Aim first: a swing only lands if the look ray clips the target.
         if env._aim_error(me, opp) > p["aim_tol"]:
@@ -122,6 +174,35 @@ class ParameterizedFSM(Opponent):
 
         dist = math.hypot(opp.x - me.x, opp.z - me.z)
         rng = self.rng
+        # A hit is "available" this tick when in reach, aimed (step 1 guaranteed it), and -- if
+        # wait_for_charge -- fully charged. Computed once so the active-strafe swing (3a) and the
+        # main REACH-edge punish (step 4) share the same readiness gate.
+        ready = (me.charge >= 1.0) if p["wait_for_charge"] else True
+
+        # 3a) Active strafe run: a committed sustained A/D tap (a Gaussian-length run started in
+        #     step 7). Movement is STICKY (the env only frictions velocity ~0.91/tick and ATTACK
+        #     leaves velocity untouched), so the lateral momentum carries even on a tick we DON'T
+        #     re-tap -- the bot can swing mid-run and still drift sideways, circle-strafing AND
+        #     attacking. Sprint-strafe: strafing now PRESERVES the sprint flag (env), so if the run
+        #     was entered sprinting a mid-strafe swing lands the FULL sprint-knockback -- a real
+        #     sprint hit while circle-strafing. Preserving combos: when a full-charge hit is
+        #     available at reach it takes the SAME ATTACK path as the main punish (scheduling the
+        #     s-tap), so the hit still lands its knockback and the s-tap / re-engage rhythm keeps
+        #     running through the strafe; a swing at reach also knocks the opponent back, which
+        #     reopens spacing. Otherwise it keeps >= 3 block spacing: inside 3 blocks it reopens
+        #     with BACK, else it re-taps the strafe direction. The run count decrements every tick.
+        if self._strafe > 0:
+            self._strafe -= 1
+            if dist <= REACH and ready and rng.random() < p["attack_prob"]:
+                self._counts["attack"] += 1
+                if p["stap_ticks"] > 0:
+                    self._stap = p["stap_ticks"]   # keep the combo's post-hit sprint-reset tap
+                return ATTACK
+            if dist < STRAFE_MIN_SPACING:
+                self._counts["retreat"] += 1
+                return BACK
+            self._counts["strafe"] += 1
+            return self._strafe_dir
 
         # 4) Punish at the REACH edge FIRST. If a hit can land right now (in reach, charged when
         #    wait_for_charge, already aimed by step 1), swing before any spacing/jump decision.
@@ -129,59 +210,6 @@ class ParameterizedFSM(Opponent):
         #    order then re-APPROACHED from there instead of swinging, so a stationary spam-clicker
         #    (the "turtle") chipped the FSM for free and was never punished. Swinging at the edge
         #    lands the full-charge sprint-knockback punish that actually beats the turtle.
-        ready = (me.charge >= 1.0) if p["wait_for_charge"] else True
-
-        # 4a) Jump-reset (crit) combo. A landed swing sends the FSM to 0 charge, and an opponent
-        #     that sits in that ~12.5-tick recharge window chips it for free -- "abusing the
-        #     cooldown space." The counter is to make every punish a CRITICAL hit: env grants
-        #     1.5x damage only for a full-charge swing that lands while airborne + descending +
-        #     not sprinting. So once the FSM is charged and in reach it commits a sticky combo --
-        #     drop sprint, jump, ride to the apex, then swing on the way down for the crit --
-        #     instead of a flat-footed swing. The extra 50% damage per punish flips the recharge-
-        #     window trade back in the FSM's favor. self._air keeps the combo sticky so a per-tick
-        #     rng can't abort it mid-air.
-        if p["jump_reset"] and (self._air > 0 or (dist <= REACH and me.charge >= 1.0
-                                                  and rng.random() < p["attack_prob"])):
-            # Once committed, self._air locks the combo on until the crit lands (or the target is
-            # lost), so the FSM's own spacing/sprint logic can't abort it mid-air. Bail after a
-            # few seconds so a committed combo can't walk forever chasing a kiter (the non-sprint
-            # FORWARD used mid-combo can't catch a sprinting runner) -- hand back to normal spacing.
-            self._air_ticks += 1
-            if self._air_ticks > 24:
-                self._air = 0
-                self._air_ticks = 0
-            else:
-                if not me.aim_lock:
-                    self._air = max(self._air, 1)
-                    return LOOK_AT_TARGET          # latch aim so it tracks through the whole jump
-                if me.sprinting:
-                    # crit needs not-sprinting: shed sprint with a STRAFE (aim stays locked,
-                    # distance roughly held), not a BACK that would backpedal out of reach.
-                    self._air = 1
-                    self._counts["strafe"] += 1
-                    return STRAFE_LEFT if rng.random() < 0.5 else STRAFE_RIGHT
-                if me.on_ground:
-                    self._air = 2
-                    return JUMP                        # launch
-                if me.vy >= 0.0:
-                    self._air = 3                     # rising: hold if in reach, else close (no sprint)
-                    if dist <= REACH:
-                        self._counts["idle"] += 1
-                        return IDLE
-                    self._counts["approach"] += 1
-                    return FORWARD
-                # descending (vy < 0), airborne, full charge, not sprinting:
-                if dist <= REACH:
-                    self._air = 0                     # the swing crits (1.5x)
-                    self._air_ticks = 0
-                    self._counts["attack"] += 1
-                    if p["stap_ticks"] > 0:
-                        self._stap = p["stap_ticks"]
-                    return ATTACK
-                self._air = 3                         # fell short: close in (still not sprinting)
-                self._counts["approach"] += 1
-                return FORWARD
-
         if dist <= REACH and ready and rng.random() < p["attack_prob"]:
             self._counts["attack"] += 1
             if p["stap_ticks"] > 0:
@@ -193,8 +221,9 @@ class ParameterizedFSM(Opponent):
                 # Back out of reach to charge safely, then lunge in for the punish next cycle.
                 self._counts["retreat"] += 1
                 return BACK
-            # Otherwise hold with IDLE, which PRESERVES the sprint flag (unlike strafe/back) so the
-            # eventual full-charge hit still lands the sprint-knockback bonus (correct hit timing).
+            # Otherwise hold with IDLE, which PRESERVES the sprint flag (like strafe, unlike BACK)
+            # so the eventual full-charge hit still lands the sprint-knockback bonus (correct hit
+            # timing) without drifting off the spot.
             self._counts["idle"] += 1
             return IDLE
 
@@ -210,10 +239,22 @@ class ParameterizedFSM(Opponent):
             self._counts["retreat"] += 1
             return BACK
 
-        # 7) In-band variety: strafe or a brief pause (the unpredictable spacing the teacher wants).
+        # 7) In-band variety: START a strafe run or a brief pause (the unpredictable spacing the
+        #    teacher wants). A/D direction is a 50/50 coin flip, and the run LENGTH is sampled from a
+        #    Gaussian centered on strafe_ticks (sigma = strafe_ticks/3) so most runs land near that
+        #    target width. The run is then carried out by the active-strafe block (3a), which keeps
+        #    >= 3 block spacing throughout. Once a run is committed step 7 is unreachable (3a returns
+        #    first) until it finishes.
         if rng.random() < p["strafe_prob"]:
+            self._strafe_dir = STRAFE_LEFT if rng.random() < 0.5 else STRAFE_RIGHT   # 50/50 A vs D
+            sigma = max(1.0, p["strafe_ticks"] / 3.0)
+            self._strafe = max(1, round(rng.gauss(p["strafe_ticks"], sigma)))
+            self._strafe -= 1                              # this tick is the run's first step
+            if dist < STRAFE_MIN_SPACING:
+                self._counts["retreat"] += 1
+                return BACK
             self._counts["strafe"] += 1
-            return STRAFE_LEFT if rng.random() < 0.5 else STRAFE_RIGHT
+            return self._strafe_dir
         if p["pause_prob"] > 0.0 and rng.random() < p["pause_prob"]:
             self._pause = p["pause_ticks"]
             self._counts["idle"] += 1
@@ -321,6 +362,7 @@ class AdaptiveTeacher(Opponent):
         "preferred_distance": (1.5, 4.0), "band": (0.2, 1.0), "attack_prob": (0.3, 1.0),
         "retreat_prob": (0.0, 0.8), "strafe_prob": (0.0, 0.8), "jump_prob": (0.0, 0.2),
         "pause_prob": (0.0, 0.4), "pause_ticks": (0, 8, "int"), "stap_ticks": (0, 3, "int"),
+        "strafe_ticks": (1, 8, "int"),
     }
     BOOL_PARAMS = ("wait_for_charge", "bait", "jump_reset")
 
