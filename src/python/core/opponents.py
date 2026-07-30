@@ -25,7 +25,7 @@ from collections import deque
 
 from environment import (
     REACH, IDLE, BACK, JUMP, STRAFE_LEFT, STRAFE_RIGHT, SPRINT_FORWARD, FORWARD, ATTACK,
-    LOOK_AT_TARGET,
+    LOOK_AT_TARGET, _ray_hits,
 )
 
 # Minimum spacing (blocks) the FSM keeps while strafing: a strafe run circle-strafes at range,
@@ -174,9 +174,18 @@ class ParameterizedFSM(Opponent):
 
         dist = math.hypot(opp.x - me.x, opp.z - me.z)
         rng = self.rng
-        # A hit is "available" this tick when in reach, aimed (step 1 guaranteed it), and -- if
-        # wait_for_charge -- fully charged. Computed once so the active-strafe swing (3a) and the
-        # main REACH-edge punish (step 4) share the same readiness gate.
+        # Whether a swing THIS tick would actually connect. The hitbox is a non-rotating AABB, so
+        # the reach in blocks depends on the approach angle -- a diagonal look ray clips the box's
+        # corner and connects from FARTHER (center-dist) than a head-on face hit. A single center-
+        # distance threshold (dist <= REACH) can't express that: it under-reaches on diagonals and
+        # over-reaches head-on. So the swing gate reuses the env's OWN ray-vs-AABB test
+        # (_ray_hits, the exact predicate _perform_attack uses to resolve a hit) -- the FSM swings
+        # exactly when the mod would register the hit. Step 1 has already aimed at the target, so
+        # the ray points the right way.
+        can_hit = _ray_hits(me, opp)
+        # A hit is "available" this tick when the swing would connect, aimed (step 1 guaranteed it),
+        # and -- if wait_for_charge -- fully charged. Computed once so the active-strafe swing (3a)
+        # and the main punish (step 4) share the same readiness gate.
         ready = (me.charge >= 1.0) if p["wait_for_charge"] else True
 
         # 3a) Active strafe run: a committed sustained A/D tap (a Gaussian-length run started in
@@ -193,7 +202,7 @@ class ParameterizedFSM(Opponent):
         #     with BACK, else it re-taps the strafe direction. The run count decrements every tick.
         if self._strafe > 0:
             self._strafe -= 1
-            if dist <= REACH and ready and rng.random() < p["attack_prob"]:
+            if can_hit and ready and rng.random() < p["attack_prob"]:
                 self._counts["attack"] += 1
                 if p["stap_ticks"] > 0:
                     self._stap = p["stap_ticks"]   # keep the combo's post-hit sprint-reset tap
@@ -208,14 +217,16 @@ class ParameterizedFSM(Opponent):
         #    wait_for_charge, already aimed by step 1), swing before any spacing/jump decision.
         #    A landed hit knocks an approacher back to the reach boundary; the OLD spacing-first
         #    order then re-APPROACHED from there instead of swinging, so a stationary spam-clicker
-        #    (the "turtle") chipped the FSM for free and was never punished. Swinging at the edge
-        #    lands the full-charge sprint-knockback punish that actually beats the turtle.
-        if dist <= REACH and ready and rng.random() < p["attack_prob"]:
+        #    (the "turtle") chipped the FSM for free and was never punished. Swinging whenever the
+        #    hit WOULD connect (can_hit) lands the full-charge sprint-knockback punish that actually
+        #    beats the turtle -- and closes the old dead zone where the turtle's longer ray-hit
+        #    range let it chip from just outside the FSM's center-distance swing gate.
+        if can_hit and ready and rng.random() < p["attack_prob"]:
             self._counts["attack"] += 1
             if p["stap_ticks"] > 0:
                 self._stap = p["stap_ticks"]   # schedule the post-hit sprint-reset tap
             return ATTACK
-        if dist <= REACH and not ready:
+        if can_hit and not ready:
             if p["bait"]:
                 # Recharging inside the turtle's reach is a losing trade (it chips every tick).
                 # Back out of reach to charge safely, then lunge in for the punish next cycle.
