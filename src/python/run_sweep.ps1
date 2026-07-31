@@ -49,6 +49,39 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
 
+# Resolve a python that can ACTUALLY run scripts. Bare 'python' on Windows is often the Microsoft
+# Store alias stub (in ...\WindowsApps\), which prints "Python was not found" and exits nonzero
+# WITHOUT running anything -- that silently produced an empty run folder followed by a cryptic
+# analysis failure. If the caller passed an explicit -Python we trust it; otherwise we probe the
+# 'py' launcher, then python3/python, skip the Store stub, and verify each actually executes.
+function Resolve-Python {
+    param([string] $Preferred)
+    if ($Preferred -and $Preferred -ne 'python') { return $Preferred }   # explicit override -> trust it
+    $candidates = @()
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $exe = & py -3 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $exe) { $candidates += $exe.Trim() }
+    }
+    foreach ($name in 'python3', 'python') {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -notlike '*\WindowsApps\*') { $candidates += $cmd.Source }
+    }
+    foreach ($c in $candidates) {
+        & $c -c "import sys" 2>$null
+        if ($LASTEXITCODE -eq 0) { return $c }
+    }
+    return $null
+}
+
+$Python = Resolve-Python -Preferred $Python
+if (-not $Python) {
+    Write-Host "No working Python interpreter found." -ForegroundColor Red
+    Write-Host "(Bare 'python' on PATH is the Microsoft Store alias stub, which cannot run scripts.)" -ForegroundColor Red
+    Write-Host "Re-run with an explicit interpreter, e.g.:  ./run_sweep.ps1 -Python C:\path\to\python.exe" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "Using Python: $Python" -ForegroundColor DarkGray
+
 # Isolate THIS sweep in its own timestamped folder so analyze.py only ever sees this run's CSVs
 # (a flat shared 'runs/' would let stale *_metrics.csv from earlier runs pollute the aggregate).
 $stamp  = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
@@ -93,6 +126,13 @@ Write-Host "Checkpoints + metrics CSVs are in: $runDir"
 # Aggregate + summarize THIS run only. Output (summary.csv / agg_*.csv / combined.csv / *.png) is
 # written into the same timestamped folder and overwritten fresh, so it always reflects this task.
 if (-not $SkipAnalysis) {
+    # Guard: if training produced no metrics (e.g. every run crashed), the folder is empty and
+    # analyze.py would fail confusingly. Surface the real problem instead.
+    $metrics = Get-ChildItem -Path $runDir -Filter '*_metrics.csv' -ErrorAction SilentlyContinue
+    if (-not $metrics) {
+        Write-Host "`nNo *_metrics.csv were written to $runDir -- training produced no output; skipping analysis." -ForegroundColor Red
+        exit 1
+    }
     Write-Host "`n=== Analyzing this run ($stamp) ===" -ForegroundColor Cyan
     & $Python analyze.py --runs-dir $runDir --out-dir $runDir
     if ($LASTEXITCODE -ne 0) {
