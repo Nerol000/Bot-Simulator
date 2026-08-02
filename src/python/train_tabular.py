@@ -19,7 +19,7 @@ import numpy as np
 
 from environment import DuelEnv, NUM_ACTIONS, MAX_HEALTH
 from core.tabular import TabularQLearner
-from core.opponents import ParameterizedFSM, AdaptiveTeacher, SnapshotOpponent
+from core.opponents import ParameterizedFSM, AdaptiveTeacher, ImprovementTeacher, SnapshotOpponent
 
 CKPT = "qtable.csv"
 
@@ -28,6 +28,10 @@ OPPONENTS = {
     # teacher/td_error now adapt online to MAXIMIZE the learner's TD error (bandit over FSM
     # modes) rather than a single static preset whose avg_td overlapped the champion's.
     "teacher": AdaptiveTeacher,
+    # improve = H2-proper: same bandit/evolution, but rewards genomes by the learner's measured
+    # improvement (delta eval health_diff per block) instead of TD error -- optimizes teaching
+    # directly rather than via the surprise proxy. Wants frequent evals (small --eval-every).
+    "improve": ImprovementTeacher,
     "win_max": ParameterizedFSM.win_max,
     "td_error": AdaptiveTeacher,
     "selfplay": SnapshotOpponent,
@@ -138,6 +142,13 @@ def main():
     is_selfplay = isinstance(opponent, SnapshotOpponent)
     # An AdaptiveTeacher steers its FSM mode by the learner's TD error, so feed it each step.
     opp_feedback = getattr(opponent, "feedback", None)
+    # An ImprovementTeacher (H2-proper) instead steers by the learner's IMPROVEMENT, fed once per
+    # eval as the change in eval health_diff. prev_eval_hd holds the previous eval's score so the
+    # block delta is well-defined; seed it with a pre-training baseline eval below.
+    opp_improve = getattr(opponent, "improvement_feedback", None)
+    prev_eval_hd = None
+    if opp_improve is not None:
+        prev_eval_hd = evaluate(env, learner)["health_diff"]   # baseline (random policy floor)
     best_score = -1e9
     # Smoothed learning-curve trackers so plots reflect progress, not per-eval noise: an EMA of
     # health_diff and the running best-so-far (monotonic). The raw latest-eval line swings wildly
@@ -179,6 +190,11 @@ def main():
             m = evaluate(env, learner)
             avg_td = float(np.mean(recent_td)) if recent_td else 0.0
             hd = m["health_diff"]
+            # H2-proper: credit the block's genome with the improvement since the last eval, then
+            # let the teacher evolve/select the next block's genome.
+            if opp_improve is not None:
+                opp_improve(hd - prev_eval_hd)
+                prev_eval_hd = hd
             hdiff_ema = hd if hdiff_ema is None else 0.3 * hd + 0.7 * hdiff_ema
             hdiff_best = max(hdiff_best, hd)
             print(f"  [eval vs w-tap] hdiff={hd:+.3f}  ema={hdiff_ema:+.3f}  best={hdiff_best:+.3f}  "

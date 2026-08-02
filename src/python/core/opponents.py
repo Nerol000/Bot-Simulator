@@ -15,6 +15,12 @@ AdaptiveTeacher is the TD-Error / Teacher arm proper: instead of a single hand-t
 predict" genome (whose avg_td overlaps the champion's because what surprises the learner drifts
 as it improves), it runs a non-stationary bandit over a BANK of ParameterizedFSM behavior modes
 and each episode plays the mode that currently maximizes the learner's measured |TD error|.
+
+ImprovementTeacher is the H2-proper arm: same population/UCB/evolution machinery as
+AdaptiveTeacher, but it rewards genomes by the learner's DIRECTLY measured improvement (change in
+eval health_diff per block) instead of TD error. AdaptiveTeacher uses surprise as a PROXY for
+good teaching; ImprovementTeacher optimizes the teaching objective directly, so comparing the two
+is the sharp form of H2.
 """
 
 import copy
@@ -524,6 +530,84 @@ class AdaptiveTeacher(Opponent):
             "best_genome": best,
         }
         return {**self._fsm.behavior_summary(), **summary}
+
+
+class ImprovementTeacher(AdaptiveTeacher):
+    """H2-proper teacher: rewards genomes by the learner's measured IMPROVEMENT (change in eval
+    health_diff) instead of its TD error.
+
+    Reuses AdaptiveTeacher's entire machinery -- the genome POPULATION, the non-stationary
+    discounted-UCB selection, and the mutate/evict EVOLUTION -- and swaps ONLY the reward signal:
+
+        AdaptiveTeacher reward  = mean per-tick |TD error|   (surprise; the H1 mechanism, a PROXY
+                                                              for good teaching)
+        ImprovementTeacher reward = delta eval health_diff   (actual learner improvement; the H2
+                                                              objective, measured DIRECTLY)
+
+    This is the arm that turns H2 from "does the surprise-maximizing teacher ALSO improve the
+    learner?" into a head-to-head "does directly optimizing improvement beat using surprise as a
+    proxy?". Comparing ImprovementTeacher against AdaptiveTeacher is the sharp form of H2.
+
+    Credit assignment -- why ONE genome per inter-eval BLOCK (not per episode):
+        The improvement signal only exists at eval boundaries (one health_diff number every
+        --eval-every episodes). If the genome switched every episode, ~eval_every genomes would
+        be smeared into a single improvement delta and no genome could be credited. So a genome is
+        held for the WHOLE block between two evals; the improvement over that block is that
+        genome's reward. reset() (per episode) just starts a new game with the SAME genome;
+        improvement_feedback(delta) at the block boundary commits the reward, evolves, and selects
+        the next block's genome.
+
+    Caveat (state this in the writeup): the improvement signal is SPARSE and noisy -- one number
+    per eval, and health_diff has large cross-seed variance -- so this arm wants FREQUENT evals
+    (small --eval-every), a SMALL population, and long runs / many seeds to rank genomes reliably.
+    That sparsity is the fundamental cost of optimizing improvement directly, and is itself a
+    finding worth reporting."""
+
+    def __init__(self, name="improve", seed=0, **kw):
+        # The sparse improvement signal can rank only a few genomes: keep the population small
+        # (6 anchors + a couple of evolvable slots) and evolve more eagerly than the TD teacher.
+        kw.setdefault("pop_size", 8)
+        kw.setdefault("evolve_every", 6)
+        kw.setdefault("min_evals", 2)
+        super().__init__(name=name, seed=seed, **kw)
+        self._activate(self._active)   # configure the FSM up front (no per-episode re-select)
+
+    def _activate(self, gid):
+        """Make `gid` the block's genome and load it into the FSM."""
+        self._active = gid
+        self._fsm.params = {**ParameterizedFSM.DEFAULTS, **self._genome[gid]}
+        self._fsm.reset()
+
+    def feedback(self, td):
+        # TD error is NOT this teacher's objective -- ignore the per-step signal entirely.
+        return
+
+    def reset(self):
+        # New game, SAME genome for the whole block. No commit/select here: that happens at the
+        # block (eval) boundary in improvement_feedback().
+        self._fsm.reset()
+
+    def improvement_feedback(self, delta):
+        """Reward the active genome by the learner's improvement (delta eval health_diff) over the
+        block it just taught, then maybe evolve and select the next block's genome."""
+        for gid in self._genome:                      # non-stationary bandit: decay all counts
+            self._count[gid] *= self.count_discount
+        self._count[self._active] += 1.0
+        self._value[self._active] += self.ema_alpha * (delta - self._value[self._active])
+        self._commits += 1
+        if self._commits % self.evolve_every == 0:
+            self._evolve()
+        self._activate(self._select())
+
+    def behavior_summary(self):
+        best = max(self._genome, key=lambda g: self._value[g])
+        return {
+            **self._fsm.behavior_summary(),
+            "active_genome": self._active,
+            "pop_size": len(self._genome),
+            "best_improve_value": self._value[best],
+            "best_genome": best,
+        }
 
 
 class SnapshotOpponent(Opponent):
