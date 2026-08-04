@@ -48,6 +48,133 @@ def _std(xs):
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1))
 
 
+def _betacf(a, b, x, itmax=200, eps=3e-12):
+    """Continued-fraction expansion for the incomplete beta function (Numerical Recipes)."""
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < 1e-30:
+        d = 1e-30
+    d = 1.0 / d
+    h = d
+    for m in range(1, itmax + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betai(a, b, x):
+    """Regularized incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(lbeta + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def welch_ttest(a, b):
+    """Two-sided Welch's t-test (unequal variances). Returns (t, df, p).
+    Pure Python so no scipy dependency; p from the Student-t survival function."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return float("nan"), float("nan"), float("nan")
+    ma, mb = _mean(a), _mean(b)
+    va, vb = _std(a) ** 2, _std(b) ** 2
+    sa, sb = va / na, vb / nb
+    denom = sa + sb
+    if denom <= 0.0:
+        return float("nan"), float("nan"), float("nan")
+    t = (ma - mb) / math.sqrt(denom)
+    df = denom ** 2 / ((sa ** 2) / (na - 1) + (sb ** 2) / (nb - 1))
+    # two-sided p = I_{df/(df+t^2)}(df/2, 1/2)
+    p = _betai(df / 2.0, 0.5, df / (df + t * t))
+    return t, df, p
+
+
+def final_health_diff_per_seed(runs):
+    """{arm: [health_diff at the last episode common to all seeds, one per seed]}."""
+    out = {}
+    for arm, seed_map in runs.items():
+        seeds = list(seed_map)
+        if not seeds:
+            continue
+        common = set.intersection(*(set(seed_map[s]) for s in seeds))
+        if not common:
+            continue
+        last_ep = max(common)
+        out[arm] = [seed_map[s][last_ep]["health_diff"] for s in seeds]
+    return out
+
+
+def print_ttests(runs, out_dir):
+    """Welch's t-test on final health_diff for the hypothesis-relevant arm pairs."""
+    finals = final_health_diff_per_seed(runs)
+    # (label, arm_a, arm_b) -- accept teacher OR td-max naming for the surprise arm.
+    surprise = "teacher" if "teacher" in finals else ("td_error" if "td_error" in finals else None)
+    pairs = []
+    if "improve" in finals and "champion" in finals:
+        pairs.append(("H2 core: improve vs champion", "improve", "champion"))
+    if "improve" in finals and surprise:
+        pairs.append(("proxy gap: improve vs " + surprise, "improve", surprise))
+    if surprise and "champion" in finals:
+        pairs.append(("orig H2: " + surprise + " vs champion", surprise, "champion"))
+    if not pairs:
+        print("\n(no arm pairs available for t-tests)")
+        return
+    print("\n=== SIGNIFICANCE (Welch's t-test on final health_diff) ===")
+    hdr = f"{'comparison':<34}{'mean_a':>9}{'mean_b':>9}{'t':>8}{'df':>7}{'p':>10}  verdict"
+    print(hdr)
+    print("-" * len(hdr))
+    rows = []
+    for label, a_name, b_name in pairs:
+        a, b = finals[a_name], finals[b_name]
+        t, df, p = welch_ttest(a, b)
+        if math.isnan(p):
+            verdict = "need >=2 seeds/arm"
+        elif p < 0.01:
+            verdict = "significant (p<0.01)"
+        elif p < 0.05:
+            verdict = "significant (p<0.05)"
+        else:
+            verdict = "NOT significant (trend only)"
+        print(f"{label:<34}{_mean(a):>+9.3f}{_mean(b):>+9.3f}{t:>8.2f}{df:>7.1f}{p:>10.4f}  {verdict}")
+        rows.append({"comparison": label, "arm_a": a_name, "arm_b": b_name,
+                     "n_a": len(a), "n_b": len(b), "mean_a": _mean(a), "mean_b": _mean(b),
+                     "t": t, "df": df, "p_value": p, "verdict": verdict})
+    path = os.path.join(out_dir, "ttests.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Wrote {path}")
+    if any(r["n_a"] < 5 or r["n_b"] < 5 for r in rows):
+        print("NOTE: fewer than 5 seeds per arm -> p-values are weak. Re-run the sweep with more seeds.")
+
+
 def load_runs(runs_dir):
     """Return {arm: {seed: {episode: {metric: value}}}} parsed from *_metrics.csv."""
     runs = defaultdict(lambda: defaultdict(dict))
@@ -223,6 +350,7 @@ def main():
 
     write_combined_csv(os.path.join(out_dir, "combined.csv"), agg_by_arm)
     print_summary(runs, agg_by_arm, out_dir)
+    print_ttests(runs, out_dir)
     print_console_curve(agg_by_arm, args.metric)
     maybe_plot(agg_by_arm, out_dir)
     print(f"\nDone. Aggregates + summary in: {out_dir}")
