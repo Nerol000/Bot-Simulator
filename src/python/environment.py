@@ -37,7 +37,11 @@ EYE_HEIGHT = 1.62
 ATTACK_DAMAGE = 7.0
 CHARGE_PER_TICK = 1.0 / 12.5
 FULL_STRENGTH = 0.9
-PROTECTION_MULT = 0.30
+# Kit: unenchanted diamond sword (ATTACK_DAMAGE 7.0, no Sharpness) + full diamond armor with
+# Protection IV on all four pieces. Mirrors Equipment.getProtectionDamageMultiplier() in the Java
+# sim: Protection is 1 EPF per level, EPF summed across pieces (4 x IV = 16), capped at 20, and
+# incoming damage x (1 - 0.04*EPF) -> 1 - 0.04*16 = 0.36x damage taken.
+PROTECTION_MULT = 0.36
 BASE_KNOCKBACK = 0.4
 SPRINT_KNOCKBACK = 0.5
 
@@ -127,7 +131,8 @@ def _ray_hits(att, dfn, reach=REACH):
 
 class Bot:
     __slots__ = ("x", "y", "z", "vx", "vy", "vz", "yaw", "pitch",
-                 "health", "charge", "on_ground", "sprinting", "was_hit", "aim_lock")
+                 "health", "charge", "on_ground", "sprinting", "was_hit", "aim_lock",
+                 "ground_start")
 
     def reset(self, x, z, yaw):
         self.x, self.y, self.z = x, 0.0, z
@@ -139,6 +144,7 @@ class Bot:
         self.sprinting = False
         self.was_hit = False
         self.aim_lock = False
+        self.ground_start = True
 
 
 class DuelEnv:
@@ -176,6 +182,8 @@ class DuelEnv:
     # ----------------------------------------------------- self-play step
     def step(self, a1, a2):
         self.bot1.was_hit = self.bot2.was_hit = False
+        self.bot1.ground_start = self.bot1.on_ground
+        self.bot2.ground_start = self.bot2.on_ground
         hp1, hp2 = self.bot1.health, self.bot2.health
         rdy1 = self.bot1.charge > FULL_STRENGTH
         rdy2 = self.bot2.charge > FULL_STRENGTH
@@ -207,6 +215,8 @@ class DuelEnv:
     # ------------------------------------------- eval step (vs scripted w-tap)
     def step_eval(self, a1):
         self.bot1.was_hit = self.bot2.was_hit = False
+        self.bot1.ground_start = self.bot1.on_ground
+        self.bot2.ground_start = self.bot2.on_ground
         hp1, hp2 = self.bot1.health, self.bot2.health
         rdy1 = self.bot1.charge > FULL_STRENGTH
         ch1 = rdy1 and _ray_hits(self.bot1, self.bot2)
@@ -238,6 +248,8 @@ class DuelEnv:
         step_eval()'s single-learner return shape so tabular/neural learners share a loop.
         Used by the H1/H2 experiments (Win-Max / TD-Error / Champion / Teacher FSMs)."""
         self.bot1.was_hit = self.bot2.was_hit = False
+        self.bot1.ground_start = self.bot1.on_ground
+        self.bot2.ground_start = self.bot2.on_ground
         hp1, hp2 = self.bot1.health, self.bot2.health
         rdy1 = self.bot1.charge > FULL_STRENGTH
         ch1 = rdy1 and _ray_hits(self.bot1, self.bot2)
@@ -319,17 +331,30 @@ class DuelEnv:
             bot.vx -= math.cos(yaw) * WALK_IMPULSE
             bot.vz -= math.sin(yaw) * WALK_IMPULSE
         elif a == STRAFE_LEFT:
-            bot.sprinting = False
-            bot.vx += math.cos(yaw - math.pi / 2) * WALK_IMPULSE
-            bot.vz += math.sin(yaw - math.pi / 2) * WALK_IMPULSE
+            # Sprint-strafe: strafing PRESERVES the sprint flag (MC lets you sprint diagonally,
+            # W+A / W+D), so a sprint carried in from an approach keeps its sprint-knockback for a
+            # mid-strafe hit, and the lateral impulse is sprint-scaled while sprinting. Strafe alone
+            # can't START a sprint (that needs forward motion), so it never SETS the flag True --
+            # it only keeps an existing one (BACK still cancels sprint; you can't sprint backward).
+            mult = SPRINT_MULTIPLIER if bot.sprinting else 1.0
+            bot.vx += math.cos(yaw - math.pi / 2) * WALK_IMPULSE * mult
+            bot.vz += math.sin(yaw - math.pi / 2) * WALK_IMPULSE * mult
         elif a == STRAFE_RIGHT:
-            bot.sprinting = False
-            bot.vx += math.cos(yaw + math.pi / 2) * WALK_IMPULSE
-            bot.vz += math.sin(yaw + math.pi / 2) * WALK_IMPULSE
+            mult = SPRINT_MULTIPLIER if bot.sprinting else 1.0
+            bot.vx += math.cos(yaw + math.pi / 2) * WALK_IMPULSE * mult
+            bot.vz += math.sin(yaw + math.pi / 2) * WALK_IMPULSE * mult
         elif a == ATTACK:
             self._perform_attack(bot, opp)
         elif a == JUMP:
-            if bot.on_ground:
+            # A jump is a fresh upward velocity impulse, allowed whenever the bot was standing on
+            # the ground at the START of this tick -- even if an attacker's knockback has already
+            # popped it airborne (the attacker acts earlier in the same tick). Nothing here checks
+            # "was I hit?": when a jump happens to coincide with a hit, the jump's velocity simply
+            # OVERRIDES the knockback's vertical pop (plain assignment), and the horizontal result
+            # is whatever the standard vx/2 + push knockback math already produced from the bot's
+            # momentum -- so moving INTO a hit blunts the net knockback on its own, while a jump
+            # done while genuinely airborne (not grounded at tick start) grants no such relief.
+            if bot.ground_start:
                 bot.vy = JUMP_VELOCITY
                 bot.on_ground = False
         elif a == YAW_L:
