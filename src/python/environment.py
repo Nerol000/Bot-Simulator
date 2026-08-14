@@ -18,7 +18,6 @@ Gym-like, symmetric:
 import math
 import numpy as np
 
-# --- MC-like constants (mirror Environment.java) ---
 MOVEMENT_SPEED = 0.1
 WALK_IMPULSE_PER_SPEED = 0.1943
 SPRINT_MULTIPLIER = 1.3
@@ -36,7 +35,7 @@ EYE_HEIGHT = 1.62
 
 ATTACK_DAMAGE = 7.0
 CHARGE_PER_TICK = 1.0 / 12.5
-FULL_STRENGTH = 0.9
+FULL_STRENGTH = 1.0
 # Kit: unenchanted diamond sword (ATTACK_DAMAGE 7.0, no Sharpness) + full diamond armor with
 # Protection IV on all four pieces. Mirrors Equipment.getProtectionDamageMultiplier() in the Java
 # sim: Protection is 1 EPF per level, EPF summed across pieces (4 x IV = 16), capped at 20, and

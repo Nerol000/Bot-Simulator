@@ -38,14 +38,14 @@ param(
     # 'improve' is the H2-proper direct-improvement teacher (use a small -EvalEvery with it).
     [string[]] $Arms      = @('champion', 'teacher', 'improve'),
     # Replication seeds (same set for every arm -> fair, averageable comparison).
-    [int[]]    $Seeds     = @(0, 1, 2, 3, 4),
+    [int[]]    $Seeds     = @(0, 1, 2, 3, 4, 5),
     # Training length per run. 20000 is comfortably past the epsilon floor for a 48x15 table.
-    [int]      $Episodes  = 20000,
+    [int]      $Episodes  = 50000,
     [int]      $MaxSteps  = 1200,
     [ValidateSet('discrete', 'continuous')]
     [string]   $Reward    = 'discrete',
-    [int]      $EvalEvery = 250,
-    [int]      $LogEvery  = 500,
+    [int]      $EvalEvery = 100,
+    [int]      $LogEvery  = 5,
     # Parent directory for sweep outputs; each run creates a timestamped subfolder under it.
     [string]   $OutDir    = 'runs',
     # Skip the automatic analyze.py pass at the end (training CSVs are still written).
@@ -73,7 +73,7 @@ function Test-PythonUsable {
 function Resolve-Python {
     param([string] $Preferred)
     $names = @()
-    if ($Preferred) { $names += $Preferred }        # caller's choice first
+    if ($Preferred) { $names += $Preferred } 
     $names += @('py', 'python3', 'python')
     foreach ($n in $names) {
         $cmd = Get-Command $n -ErrorAction SilentlyContinue
