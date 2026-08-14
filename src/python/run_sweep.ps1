@@ -37,8 +37,10 @@ param(
     # Opponent arms to run. champion/teacher cover H1+H2; add selfplay and/or improve as needed.
     # 'improve' is the H2-proper direct-improvement teacher (use a small -EvalEvery with it).
     [string[]] $Arms      = @('champion', 'teacher', 'improve'),
-    # Replication seeds (same set for every arm -> fair, averageable comparison).
-    [int[]]    $Seeds     = @(0, 1, 2, 3, 4, 5),
+    # Replication seeds (same set for every arm -> fair, averageable comparison). 15 seeds gives
+    # enough statistical power for the analyze.py Welch t-test to resolve the H2 arm differences
+    # (5-6 seeds left the p-values borderline given the large cross-seed health_diff variance).
+    [int[]]    $Seeds     = @(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14),
     # Training length per run. 20000 is comfortably past the epsilon floor for a 48x15 table.
     [int]      $Episodes  = 50000,
     [int]      $MaxSteps  = 1200,

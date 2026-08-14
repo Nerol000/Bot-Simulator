@@ -209,6 +209,13 @@ def main():
                 print(f"  new best health-diff {hd:+.3f}")
 
     learner.save(ckpt)
+    # If the opponent is an adaptive teacher (td_error/teacher/improve), export its BEST converged
+    # genome so the live mod can run the ACTUAL evolved behavior (not a hand representative).
+    opp_export = getattr(opponent, "export_genome", None)
+    if opp_export is not None:
+        genome_path = os.path.join(args.out_dir, f"{tag}_genome.json")
+        opp_export(genome_path)
+        print(f"Exported best {args.opponent} genome -> {genome_path}")
     print(f"Done. Saved {ckpt}  (best: {ckpt_best}, metrics: {metrics_path})")
 
 

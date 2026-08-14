@@ -24,6 +24,7 @@ is the sharp form of H2.
 """
 
 import copy
+import json
 import math
 import random
 from abc import ABC, abstractmethod
@@ -530,6 +531,21 @@ class AdaptiveTeacher(Opponent):
             "best_genome": best,
         }
         return {**self._fsm.behavior_summary(), **summary}
+
+    def export_genome(self, path):
+        """Write the best (highest-value) genome's FULL parameter dict to `path` as JSON so the live
+        mod can load the ACTUAL converged behavior of this arm instead of a hand representative.
+        The schema (arm / genome_id / value / params) is what GenomeLoader.java reads."""
+        best = max(self._genome, key=lambda g: self._value[g])
+        payload = {
+            "arm": self.name,
+            "genome_id": best,
+            "value": self._value[best],
+            "params": {**ParameterizedFSM.DEFAULTS, **self._genome[best]},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return path
 
 
 class ImprovementTeacher(AdaptiveTeacher):
