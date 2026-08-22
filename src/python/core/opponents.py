@@ -116,6 +116,7 @@ class ParameterizedFSM(Opponent):
         self._detected_period = 0
         self._counts = {"attack": 0, "retreat": 0, "strafe": 0, "approach": 0, "idle": 0}
         self._ticks = 0
+        self._dist_sum = 0.0   # sum of center-distance to the opponent each tick (H2-A avg distance)
 
     def reset(self):
         self._pause = 0
@@ -127,10 +128,15 @@ class ParameterizedFSM(Opponent):
         self._detected_period = 0
         self._counts = {k: 0 for k in self._counts}
         self._ticks = 0
+        self._dist_sum = 0.0
 
     def act(self, env, me, opp) -> int:
         p = self.params
         self._ticks += 1
+        # H2-A behavior metric: accumulate distance to the opponent every tick (before any early
+        # return) so avg_distance reflects the whole episode, not just ticks that reach the
+        # spacing logic below.
+        self._dist_sum += math.hypot(opp.x - me.x, opp.z - me.z)
 
         # 0) Jump-reset (anti-combo DEFENSE), self-calibrating. A jump on the tick a hit lands lets
         #    the jump's upward velocity override the knockback pop while the standard vx/2 + push
@@ -283,7 +289,9 @@ class ParameterizedFSM(Opponent):
 
     def behavior_summary(self):
         t = max(self._ticks, 1)
-        return {f"{k}_rate": v / t for k, v in self._counts.items()}
+        out = {f"{k}_rate": v / t for k, v in self._counts.items()}
+        out["avg_distance"] = self._dist_sum / t
+        return out
 
     # --- presets (genomes) ---
     @classmethod

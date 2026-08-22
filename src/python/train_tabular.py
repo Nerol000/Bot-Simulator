@@ -132,6 +132,15 @@ def main():
     metrics_path = os.path.join(args.out_dir, f"{tag}_metrics.csv")
     with open(metrics_path, "w", encoding="utf-8") as mf:
         mf.write("episode,avg_td,health_diff,hdiff_ema,hdiff_best,win_rate,dmg_ratio,avg_steps\n")
+    # H2-A (behavioral differences): log the TRAINING opponent's own behavior over time so we can
+    # compare how champion vs teacher fight (attack/retreat/strafe rates + spacing). These come
+    # from opponent.behavior_summary(); block-averaged between evals. Passive -> never affects
+    # training or the H1 curves.
+    behavior_path = os.path.join(args.out_dir, f"{tag}_behavior.csv")
+    BEHAVIOR_KEYS = ["attack_rate", "retreat_rate", "strafe_rate", "approach_rate",
+                     "idle_rate", "avg_distance"]
+    with open(behavior_path, "w", encoding="utf-8") as bf:
+        bf.write("episode," + ",".join(BEHAVIOR_KEYS) + "\n")
     print(f"[run] tag={tag}  opponent={args.opponent}  seed={args.seed}  episodes={args.episodes}")
 
     opponent = OPPONENTS[args.opponent](seed=args.seed)
@@ -156,6 +165,9 @@ def main():
     hdiff_ema = None
     hdiff_best = -1e9
     recent_td = deque(maxlen=5000)   # rolling window for avg_td (bounded -> constant memory)
+    # H2-A: per-eval block accumulator of the opponent's behavior (summed per-episode summaries).
+    behav_sum = {k: 0.0 for k in BEHAVIOR_KEYS}
+    behav_eps = 0
     t0 = time.time()
 
     for ep in range(args.episodes):
@@ -176,6 +188,14 @@ def main():
             if opp_feedback is not None:
                 opp_feedback(td)
         learner.decay_epsilon()
+
+        # H2-A: fold this episode's opponent behavior into the block accumulator. Read BEFORE the
+        # next opponent.reset() (top of the loop) clears the FSM's per-episode counts.
+        bs = opponent.behavior_summary()
+        for k in BEHAVIOR_KEYS:
+            if k in bs:
+                behav_sum[k] += float(bs[k])
+        behav_eps += 1
 
         # Self-play: periodically freeze the current learner into the past-self pool.
         if is_selfplay and (ep + 1) % args.snapshot_every == 0:
@@ -207,6 +227,13 @@ def main():
                 best_score = hd
                 learner.save(ckpt_best)
                 print(f"  new best health-diff {hd:+.3f}")
+            # H2-A: flush the block's mean opponent behavior, then reset the accumulator.
+            if behav_eps > 0:
+                with open(behavior_path, "a", encoding="utf-8") as bf:
+                    vals = [f"{behav_sum[k] / behav_eps:.6f}" for k in BEHAVIOR_KEYS]
+                    bf.write(f"{ep+1}," + ",".join(vals) + "\n")
+                behav_sum = {k: 0.0 for k in BEHAVIOR_KEYS}
+                behav_eps = 0
 
     learner.save(ckpt)
     # If the opponent is an adaptive teacher (td_error/teacher/improve), export its BEST converged
