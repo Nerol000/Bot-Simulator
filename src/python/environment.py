@@ -310,7 +310,7 @@ class DuelEnv:
         (only ~1 in 12 swings lands). Extends the Java 24-state (distance x direction), which
         omitted charge."""
         dbucket, dirbucket = self._state_buckets(me, opp)
-        charged = 1 if me.charge > FULL_STRENGTH else 0
+        charged = 1 if me.charge >= FULL_STRENGTH else 0
         return charged * 24 + dbucket * 8 + dirbucket
 
     NUM_STATES = 48
