@@ -89,6 +89,24 @@ def band_halfwidth(std, n, mode):
     raise ValueError(f"unknown band mode {mode!r}")
 
 
+def rolling_mean(values, window):
+    """Centered rolling average for display smoothing. window<=1 returns values unchanged.
+
+    Only smooths the plotted curve/band -- the underlying agg_*.csv data is untouched, so this
+    is purely cosmetic (fewer episode-to-episode zig-zags for the paper figure). Edges use a
+    shrinking window so the line still spans the full x-range."""
+    if window <= 1 or len(values) <= 2:
+        return list(values)
+    half = window // 2
+    out = []
+    for i in range(len(values)):
+        lo = max(0, i - half)
+        hi = min(len(values), i + half + 1)
+        seg = values[lo:hi]
+        out.append(sum(seg) / len(seg))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +119,9 @@ def main():
                     help="metric column prefix to plot (default: hdiff_ema)")
     ap.add_argument("--band", default="se", choices=["se", "std", "ci95"],
                     help="shaded band: standard error (default), raw std, or 95%% CI")
+    ap.add_argument("--smooth", type=int, default=1, metavar="N",
+                    help="rolling-mean window (odd N) to de-jag the curve for display; "
+                         "1 = off (default). Cosmetic only; agg CSVs are unchanged.")
     ap.add_argument("--out", default=None, help="output PNG path (default: <results-dir>/<figure>_<metric>.png)")
     ap.add_argument("--title", default=None, help="chart title (default depends on --figure)")
     args = ap.parse_args()
@@ -171,6 +192,8 @@ def main():
         if ns:
             n_seen = max(n_seen, max(ns))
         halves = [band_halfwidth(s, n, args.band) for s, n in zip(stds, ns)]
+        means = rolling_mean(means, args.smooth)
+        halves = rolling_mean(halves, args.smooth)
         lo = [m - h for m, h in zip(means, halves)]
         hi = [m + h for m, h in zip(means, halves)]
         plt.fill_between(eps, lo, hi, alpha=0.18, color=color, linewidth=0)
