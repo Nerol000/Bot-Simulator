@@ -9,7 +9,10 @@
 param(
     [string]$ResultsDir = (Join-Path $PSScriptRoot '..\2026-07-31_13-12-49'),
     # how many trailing eval rows to average as the "converged" behavior of a run
-    [int]$LastN = 5
+    [int]$LastN = 5,
+    # H3 (opt-in): build the LEARNER behavior table from *_learner_behavior.csv instead of the
+    # opponent *_behavior.csv. Writes h3_learner_behavior_table.csv. Default OFF -> unchanged H2.
+    [switch]$Learner
 )
 
 # code arm tag -> paper label (H2-A compares champion vs teacher; improve shown if present)
@@ -25,10 +28,18 @@ $MetricRows = [ordered]@{
     approach_rate = 'Approach %'; idle_rate = 'Idle %'; avg_distance = 'Avg Distance'
 }
 
-$files = Get-ChildItem -Path $ResultsDir -Filter '*_behavior.csv' -File -ErrorAction SilentlyContinue
-if (-not $files) { throw "No *_behavior.csv in '$ResultsDir'. Run the sweep with the behavior-logging trainer first." }
-
-$re = '^(?<arm>.+)_s(?<seed>\d+)_ep(?<ep>\d+)_behavior\.csv$'
+$filter = if ($Learner) { '*_learner_behavior.csv' } else { '*_behavior.csv' }
+$files = Get-ChildItem -Path $ResultsDir -Filter $filter -File -ErrorAction SilentlyContinue
+if ($Learner) {
+    # The opponent *_behavior.csv also ends in *_behavior.csv, but the learner filter is specific.
+    $re = '^(?<arm>.+)_s(?<seed>\d+)_ep(?<ep>\d+)_learner_behavior\.csv$'
+    if (-not $files) { throw "No *_learner_behavior.csv in '$ResultsDir'. Run the sweep with -LogLearnerBehavior first." }
+} else {
+    # Exclude the learner files so a mixed folder doesn't fold them into the opponent table.
+    $files = $files | Where-Object { $_.Name -notlike '*_learner_behavior.csv' }
+    $re = '^(?<arm>.+)_s(?<seed>\d+)_ep(?<ep>\d+)_behavior\.csv$'
+    if (-not $files) { throw "No *_behavior.csv in '$ResultsDir'. Run the sweep with the behavior-logging trainer first." }
+}
 # perArm[arm][metric] = list of per-seed converged values
 $perArm = @{}
 foreach ($f in $files) {
@@ -80,7 +91,7 @@ $table = foreach ($mKey in $MetricRows.Keys) {
     [pscustomobject]$row
 }
 
-$out = Join-Path $ResultsDir 'h2_behavior_table.csv'
+$out = Join-Path $ResultsDir $(if ($Learner) { 'h3_learner_behavior_table.csv' } else { 'h2_behavior_table.csv' })
 $table | Export-Csv -NoTypeInformation $out
 $firstMetric = @($MetricRows.Keys)[0]
 $nSeeds = @($perArm[$armsPresent[0]][$firstMetric]).Count

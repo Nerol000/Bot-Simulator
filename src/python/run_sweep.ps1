@@ -53,7 +53,11 @@ param(
     # Skip the automatic analyze.py pass at the end (training CSVs are still written).
     [switch]   $SkipAnalysis,
     # Which python to call (override if it isn't on PATH as 'python').
-    [string]   $Python    = 'python'
+    [string]   $Python    = 'python',
+    # H3 (opt-in): also log each learner's own behavior during eval (-> <tag>_learner_behavior.csv).
+    # OFF by default so a normal sweep reproduces the H1/H2 data unchanged. Use a fresh -OutDir
+    # when enabling this so the H3 run never mixes with the frozen H1/H2 folder.
+    [switch]   $LogLearnerBehavior
 )
 
 $ErrorActionPreference = 'Stop'
@@ -140,6 +144,11 @@ foreach ($arm in $Arms) {
             '--out-dir',    $runDir,
             '--tag',        $tag
         )
+        # H3 (opt-in): append the learner-behavior flag only when requested, so the default sweep's
+        # argument list is byte-identical to the H1/H2 runs.
+        if ($LogLearnerBehavior) {
+            $trainArgs += '--log-learner-behavior'
+        }
         & $Python @trainArgs
 
         if ($LASTEXITCODE -ne 0) {

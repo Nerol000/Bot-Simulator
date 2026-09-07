@@ -17,11 +17,24 @@ from collections import deque
 
 import numpy as np
 
-from environment import DuelEnv, NUM_ACTIONS, MAX_HEALTH
+from environment import (DuelEnv, NUM_ACTIONS, MAX_HEALTH,
+                         IDLE, FORWARD, SPRINT_FORWARD, BACK, STRAFE_LEFT, STRAFE_RIGHT, ATTACK)
 from core.tabular import TabularQLearner
 from core.opponents import ParameterizedFSM, AdaptiveTeacher, ImprovementTeacher, SnapshotOpponent
 
 CKPT = "qtable.csv"
+
+# H2 (learner behavior, Option 4): map the learner's 15 discrete actions onto the same behavior
+# categories the opponent FSM reports, so a learner-vs-opponent behavior comparison is apples-to-
+# apples. Aim/turn/jump actions have no FSM equivalent and are left uncategorized (so rates need
+# not sum to 1.0 -- same caveat as the opponent behavior_summary).
+_LEARNER_ACTION_CATEGORY = {
+    ATTACK: "attack",
+    BACK: "retreat",
+    STRAFE_LEFT: "strafe", STRAFE_RIGHT: "strafe",
+    FORWARD: "approach", SPRINT_FORWARD: "approach",
+    IDLE: "idle",
+}
 
 OPPONENTS = {
     "champion": ParameterizedFSM.champion,
@@ -38,23 +51,40 @@ OPPONENTS = {
 }
 
 
-def evaluate(env, learner, episodes=50):
+def evaluate(env, learner, episodes=50, track_behavior=False):
     """Greedy rollout of the learner vs the scripted w-tap opponent (fixed yardstick).
 
     Primary metric is `health_diff` (mean end-of-episode (my_health - opp_health)/MAX_HEALTH,
     range [-1, +1]): a CONTINUOUS skill measure that stays informative at every level, unlike
     win_rate which is 0 until the bot crosses a competence cliff then jumps. -1 = destroyed
-    dealing nothing, 0 = even trade, +1 = flawless win. This is the H1 learning-curve metric."""
+    dealing nothing, 0 = even trade, +1 = flawless win. This is the H1 learning-curve metric.
+
+    track_behavior (H3, opt-in): when True, additionally tally the learner's own greedy actions
+    and spacing and return them under "behavior". Defaults False so the H1/H2 code path is
+    byte-identical to the original -- this flag adds no RNG draws and never changes the returned
+    health_diff/win_rate/dmg_ratio/avg_steps, so a retrain reproduces H1/H2 exactly."""
     wins = 0
     total_dealt = total_taken = 0.0
     total_steps = 0
     total_hdiff = 0.0
+    # H3 (Option 4): tally the LEARNER's greedy actions + spacing so we can compare how the learner
+    # itself fights after training against each opponent. Passive -- pure observation of the eval
+    # rollout, never fed back into learning or H1 metrics.
+    lb_counts = {"attack": 0, "retreat": 0, "strafe": 0, "approach": 0, "idle": 0}
+    lb_ticks = 0
+    lb_dist = 0.0
     for _ in range(episodes):
         env.reset()
         done = False
         while not done:
             s = env.state_index(env.bot1, env.bot2)
             a = learner.act(s, greedy=True)
+            if track_behavior:
+                cat = _LEARNER_ACTION_CATEGORY.get(a)
+                if cat is not None:
+                    lb_counts[cat] += 1
+                lb_dist += env._dist()
+                lb_ticks += 1
             _, _, done, info = env.step_eval(a)
             total_dealt += info["dmg_dealt"]
             total_taken += info["dmg_taken"]
@@ -63,12 +93,18 @@ def evaluate(env, learner, episodes=50):
             wins += 1
         total_hdiff += (max(0.0, env.bot1.health) - max(0.0, env.bot2.health)) / MAX_HEALTH
     n = episodes
-    return {
+    result = {
         "health_diff": total_hdiff / n,
         "win_rate": wins / n,
         "dmg_ratio": total_dealt / max(total_taken, 1e-6),
         "avg_steps": total_steps / n,
     }
+    if track_behavior:
+        t = max(lb_ticks, 1)
+        behavior = {f"{k}_rate": v / t for k, v in lb_counts.items()}
+        behavior["avg_distance"] = lb_dist / t
+        result["behavior"] = behavior
+    return result
 
 
 def main():
@@ -106,6 +142,9 @@ def main():
                     help="directory for checkpoints and the metrics CSV")
     ap.add_argument("--tag", default=None,
                     help="filename stem for this run (default: <opponent>_s<seed>_ep<episodes>)")
+    ap.add_argument("--log-learner-behavior", action="store_true",
+                    help="H3 (opt-in): also write <tag>_learner_behavior.csv logging the learner's "
+                         "own actions during eval. OFF by default so H1/H2 runs are unchanged.")
     args = ap.parse_args()
 
     # time_penalty=0.0: the 24x15 table can't out-run the per-tick drain (it sinks learned cells
@@ -141,6 +180,16 @@ def main():
                      "idle_rate", "avg_distance"]
     with open(behavior_path, "w", encoding="utf-8") as bf:
         bf.write("episode," + ",".join(BEHAVIOR_KEYS) + "\n")
+    # H2 (Option 4): log the LEARNER's own behavior at each eval (greedy policy = what it actually
+    # learned to do), so we can test whether learners trained against different opponents fight
+    # H3 (Option 4, opt-in): log the LEARNER's own behavior at each eval (greedy policy = what it
+    # actually learned to do), so we can test whether learners trained against different opponents
+    # fight differently. Written to a SEPARATE file from the opponent behavior above; only created
+    # when --log-learner-behavior is passed, so default H1/H2 runs are unchanged.
+    learner_behavior_path = os.path.join(args.out_dir, f"{tag}_learner_behavior.csv")
+    if args.log_learner_behavior:
+        with open(learner_behavior_path, "w", encoding="utf-8") as lbf:
+            lbf.write("episode," + ",".join(BEHAVIOR_KEYS) + "\n")
     print(f"[run] tag={tag}  opponent={args.opponent}  seed={args.seed}  episodes={args.episodes}")
 
     opponent = OPPONENTS[args.opponent](seed=args.seed)
@@ -207,7 +256,7 @@ def main():
             print(f"ep {ep+1:6d}  avg_td={avg_td:7.3f}  eps={learner.eps:.3f}  {sps:.1f} ep/s")
 
         if (ep + 1) % args.eval_every == 0:
-            m = evaluate(env, learner)
+            m = evaluate(env, learner, track_behavior=args.log_learner_behavior)
             avg_td = float(np.mean(recent_td)) if recent_td else 0.0
             hd = m["health_diff"]
             # H2-proper: credit the block's genome with the improvement since the last eval, then
@@ -227,6 +276,14 @@ def main():
                 best_score = hd
                 learner.save(ckpt_best)
                 print(f"  new best health-diff {hd:+.3f}")
+            # H3 (Option 4, opt-in): flush this eval's learner behavior (single greedy rollout
+            # block). Only when --log-learner-behavior is set; otherwise this block is skipped and
+            # the run is identical to the H1/H2 baseline.
+            if args.log_learner_behavior:
+                lb = m["behavior"]
+                with open(learner_behavior_path, "a", encoding="utf-8") as lbf:
+                    vals = [f"{lb[k]:.6f}" for k in BEHAVIOR_KEYS]
+                    lbf.write(f"{ep+1}," + ",".join(vals) + "\n")
             # H2-A: flush the block's mean opponent behavior, then reset the accumulator.
             if behav_eps > 0:
                 with open(behavior_path, "a", encoding="utf-8") as bf:
