@@ -148,7 +148,9 @@ class Bot:
 
 class DuelEnv:
     def __init__(self, max_steps=1200, seed=0, time_penalty=TIME_PENALTY,
-                 reward_mode="continuous", miss_penalty=MISS_PENALTY):
+                 reward_mode="continuous", miss_penalty=MISS_PENALTY,
+                 d_dmg_dealt_w=D_DMG_DEALT_W, d_dmg_taken_w=D_DMG_TAKEN_W,
+                 d_kill=D_KILL, d_death=D_DEATH, d_closer=D_CLOSER):
         self.max_steps = max_steps
         # Per-tick reward drain that discourages the "both bots run away forever" stalemate.
         # Kept at TIME_PENALTY for the neural learner; the tabular trainer passes 0.0, because
@@ -161,6 +163,16 @@ class DuelEnv:
         # Penalty for a charged-but-mis-aimed swing (continuous reward only). Exposed so the
         # tabular/coarse-state path can disable it (it over-punishes 45-degree-bucket aiming).
         self.miss_penalty = miss_penalty
+        # Discrete-reward weights (tabular). Defaults reproduce the original constants exactly, so
+        # existing experiments are unchanged; the tabular trainer can override them to keep the
+        # engage/attack cells net-positive across long runs against a strong opponent (otherwise
+        # the big death terminal discounts back onto those cells and inverts the greedy policy ->
+        # the bot learns to disengage / retreat / never commit a swing).
+        self.d_dmg_dealt_w = d_dmg_dealt_w
+        self.d_dmg_taken_w = d_dmg_taken_w
+        self.d_kill = d_kill
+        self.d_death = d_death
+        self.d_closer = d_closer
         self.rng = np.random.default_rng(seed)
         self.bot1 = Bot()
         self.bot2 = Bot()
@@ -550,13 +562,13 @@ class DuelEnv:
                 r += D_TURN_CLOSER
             r -= D_TURN_PENALTY
         if db < prev_db:
-            r += D_CLOSER                   # moved into a nearer distance bucket
+            r += self.d_closer              # moved into a nearer distance bucket
         if action == ATTACK and not could_hit:
             r -= D_MISS
-        r += D_DMG_DEALT_W * dmg_dealt
-        r -= D_DMG_TAKEN_W * dmg_taken
+        r += self.d_dmg_dealt_w * dmg_dealt
+        r -= self.d_dmg_taken_w * dmg_taken
         if opp.health <= 0:
-            r += D_KILL
+            r += self.d_kill
         if me.health <= 0:
-            r -= D_DEATH
+            r -= self.d_death
         return r

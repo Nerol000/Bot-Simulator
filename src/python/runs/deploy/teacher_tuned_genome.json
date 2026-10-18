@@ -1,0 +1,21 @@
+{
+  "arm": "teacher",
+  "genome_id": "evo172",
+  "value": 0.5000551617677251,
+  "params": {
+    "preferred_distance": 4.0,
+    "band": 0.2,
+    "attack_prob": 0.3,
+    "retreat_prob": 0.25499131340200476,
+    "strafe_prob": 0.0,
+    "strafe_ticks": 7,
+    "jump_prob": 0.013270432602736639,
+    "pause_prob": 0.30009237775146286,
+    "pause_ticks": 5,
+    "aim_tol": 0.25,
+    "wait_for_charge": true,
+    "stap_ticks": 1,
+    "bait": false,
+    "jump_reset": true
+  }
+}

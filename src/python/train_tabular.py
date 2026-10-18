@@ -123,6 +123,27 @@ def main():
     # only affects --reward continuous; disable to stop over-punishing coarse-bucket aiming.
     ap.add_argument("--miss-penalty", type=float, default=None,
                     help="override continuous-reward MISS_PENALTY (e.g. 0 to disable)")
+    # Reward-balance overrides for the discrete (tabular) reward. Left at None -> use the module
+    # defaults (existing experiments reproduce exactly). The problem they fix: against a strong
+    # opponent the bot loses most episodes, so the death terminal (D_DEATH) discounts back onto
+    # the approach/attack cells and drives them net-negative; the greedy policy then prefers
+    # passive cells (LOOK_AT / IDLE / BACK) and the deployed bot only retreats and never commits
+    # a swing. Lowering the death penalty and raising the closing/damage reward keeps "attack
+    # when it can land" and "approach" locally positive so those cells stay above the passive
+    # ones even after 50k episodes.
+    ap.add_argument("--death-penalty", type=float, default=None,
+                    help="[discrete] override D_DEATH (default 25.0; try ~5 for stable engaging)")
+    ap.add_argument("--kill-bonus", type=float, default=None,
+                    help="[discrete] override D_KILL (default 30.0)")
+    ap.add_argument("--dmg-dealt-w", type=float, default=None,
+                    help="[discrete] override D_DMG_DEALT_W (default 2.0)")
+    ap.add_argument("--closer-weight", type=float, default=None,
+                    help="[discrete] override D_CLOSER, the reward for closing a distance bucket "
+                         "(default 0.01)")
+    ap.add_argument("--tabular-tuned", action="store_true",
+                    help="apply a reward balance that keeps the engage/attack cells net-positive "
+                         "over long runs (death-penalty=5, kill-bonus=30, dmg-dealt-w=3, "
+                         "closer-weight=0.05). Individual --death-penalty/etc. still override it.")
     # --opponent selfplay only: how often to freeze the learner into the snapshot pool, and how
     # many past selves to keep. The opponent samples one snapshot per episode from this pool.
     ap.add_argument("--snapshot-every", type=int, default=250,
@@ -153,6 +174,18 @@ def main():
                       reward_mode=args.reward)
     if args.miss_penalty is not None:
         env_kwargs["miss_penalty"] = args.miss_penalty
+    # --tabular-tuned: a reward balance that stops the death terminal from inverting the greedy
+    # policy on long runs. Individual overrides below still win over the preset.
+    if args.tabular_tuned:
+        env_kwargs.update(d_death=5.0, d_kill=30.0, d_dmg_dealt_w=3.0, d_closer=0.05)
+    if args.death_penalty is not None:
+        env_kwargs["d_death"] = args.death_penalty
+    if args.kill_bonus is not None:
+        env_kwargs["d_kill"] = args.kill_bonus
+    if args.dmg_dealt_w is not None:
+        env_kwargs["d_dmg_dealt_w"] = args.dmg_dealt_w
+    if args.closer_weight is not None:
+        env_kwargs["d_closer"] = args.closer_weight
     env = DuelEnv(**env_kwargs)
     learner = TabularQLearner(env.NUM_STATES, NUM_ACTIONS, seed=args.seed)
 
@@ -271,11 +304,17 @@ def main():
             with open(metrics_path, "a", encoding="utf-8") as mf:
                 mf.write(f"{ep+1},{avg_td:.6f},{hd:.6f},{hdiff_ema:.6f},{hdiff_best:.6f},"
                          f"{m['win_rate']:.6f},{m['dmg_ratio']:.6f},{m['avg_steps']:.3f}\n")
-            learner.save(ckpt)
-            if hd > best_score:
-                best_score = hd
-                learner.save(ckpt_best)
-                print(f"  new best health-diff {hd:+.3f}")
+            learner.save(ckpt, deploy_safe=True)
+            # Select the deployed table by the SMOOTHED score (EMA), not a single raw eval. The
+            # greedy policy sits on coarse-bucket decision boundaries and the (adaptive) opponent
+            # is stochastic, so raw per-eval health_diff swings between ~+0.9 and -1.0 from one
+            # eval to the next -- picking the single best raw eval deploys a lucky, unstable
+            # snapshot (exactly the table that only-retreats in game). The EMA best is a policy
+            # that scored well consistently. Saved deploy-safe so untrained cells can't hijack it.
+            if hdiff_ema > best_score:
+                best_score = hdiff_ema
+                learner.save(ckpt_best, deploy_safe=True)
+                print(f"  new best health-diff (ema) {hdiff_ema:+.3f}")
             # H3 (Option 4, opt-in): flush this eval's learner behavior (single greedy rollout
             # block). Only when --log-learner-behavior is set; otherwise this block is skipped and
             # the run is identical to the H1/H2 baseline.
@@ -292,7 +331,7 @@ def main():
                 behav_sum = {k: 0.0 for k in BEHAVIOR_KEYS}
                 behav_eps = 0
 
-    learner.save(ckpt)
+    learner.save(ckpt, deploy_safe=True)
     # If the opponent is an adaptive teacher (td_error/teacher/improve), export its BEST converged
     # genome so the live mod can run the ACTUAL evolved behavior (not a hand representative).
     opp_export = getattr(opponent, "export_genome", None)

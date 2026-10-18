@@ -76,6 +76,7 @@ class TabularQLearner:
                  lr=0.1, lr_end=0.01, lr_decay=0.002, gamma=0.9,
                  eps_start=1.0, eps_end=0.05, eps_decay=0.9995, seed=0):
         self.table = QTable(num_states, num_actions)
+        self.num_states = num_states
         self.num_actions = num_actions
         self.lr = lr                 # starting (max) learning rate
         self.lr_end = lr_end         # floor so a non-stationary opponent stays trackable
@@ -105,8 +106,35 @@ class TabularQLearner:
     def decay_epsilon(self):
         self.eps = max(self.eps_end, self.eps * self.eps_decay)
 
-    def save(self, path):
-        self.table.save(path)
+    def save(self, path, deploy_safe=False):
+        """Persist the table in the Java-compatible CSV format.
+
+        deploy_safe=True masks every NEVER-VISITED (count == 0) cell down to a pessimistic
+        floor before writing. Q is zero-initialized, so against a strong opponent (where the
+        learned landscape is almost entirely negative) an untrained 0.0 cell out-ranks every
+        real, negative learned action -- the greedy argmax then latches onto an action the
+        learner never actually tried (typically LOOK_AT / IDLE / a random turn), which is a
+        big part of the "bot just stands/turns and never commits" pathology. Flooring those
+        cells guarantees the deployed greedy policy only ever selects actions the learner has
+        real evidence for. Visited cells are written unchanged, so a well-trained table is
+        byte-identical to a plain save()."""
+        if not deploy_safe:
+            self.table.save(path)
+            return
+        visited = [self.table.q[s][a]
+                   for s in range(self.num_states)
+                   for a in range(self.num_actions)
+                   if self.counts[s][a] > 0]
+        floor = (min(visited) - 1.0) if visited else 0.0
+        snapshot = [
+            [self.table.q[s][a] if self.counts[s][a] > 0 else floor
+             for a in range(self.num_actions)]
+            for s in range(self.num_states)
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{self.num_states},{self.num_actions}\n")
+            for row in snapshot:
+                f.write(",".join(repr(v) for v in row) + "\n")
 
     def load(self, path):
         self.table.load(path)
